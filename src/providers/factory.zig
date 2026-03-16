@@ -635,12 +635,12 @@ test "findCompatProvider returns correct flags" {
 test "fromConfig keeps native_tools enabled for z.ai/glm providers" {
     const alloc = std.testing.allocator;
 
-    var glm_h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null);
+    var glm_h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null, null);
     defer glm_h.deinit();
     try std.testing.expect(glm_h == .compatible);
     try std.testing.expect(glm_h.compatible.native_tools);
 
-    var zai_h = ProviderHolder.fromConfig(alloc, "z.ai", "key", null, true, null);
+    var zai_h = ProviderHolder.fromConfig(alloc, "z.ai", "key", null, true, null, null);
     defer zai_h.deinit();
     try std.testing.expect(zai_h == .compatible);
     try std.testing.expect(zai_h.compatible.native_tools);

@@ -327,6 +327,18 @@ pub fn curlStream(
         argc += 1;
     }
 
+    // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
+    // This catches providers that open the SSE connection but stall mid-stream without
+    // hitting the --max-time wall (e.g. glm-5 on infini-ai hanging on large contexts).
+    argv_buf[argc] = "--speed-limit";
+    argc += 1;
+    argv_buf[argc] = "1";
+    argc += 1;
+    argv_buf[argc] = "--speed-time";
+    argc += 1;
+    argv_buf[argc] = "60";
+    argc += 1;
+
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";

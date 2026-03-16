@@ -888,7 +888,16 @@ pub const OpenAiCompatibleProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
-                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit
+                // triggered after 60 s of zero throughput) the non-streaming endpoint is
+                // likely slow too; avoid blocking for the full message_timeout_secs.
+                const fallback_timeout: u64 = if (request.timeout_secs > 0 and request.timeout_secs < 90)
+                    request.timeout_secs
+                else
+                    90;
+                var fallback_request = request;
+                fallback_request.timeout_secs = fallback_timeout;
+                const fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 // Emit visible content. For reasoning models (e.g. glm-5, kimi-k2.5)
                 // `content` may be null while `reasoning_content` holds the answer;
                 // strip think-blocks and emit whichever is non-empty.
