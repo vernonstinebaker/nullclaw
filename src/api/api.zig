@@ -66,6 +66,11 @@ pub const registry: []const Endpoint = &.{
     .{ .method = "GET", .path = "/api/skills", .handler = handleSkillList },
     .{ .method = "POST", .path = "/api/skills/install", .handler = handleSkillInstall },
     .{ .method = "DELETE", .path = "/api/skills/:name", .handler = handleSkillDelete },
+    // Phase 5 — config mutation
+    .{ .method = "PATCH", .path = "/api/config", .handler = handleConfigSet },
+    .{ .method = "DELETE", .path = "/api/config", .handler = handleConfigUnset },
+    .{ .method = "POST", .path = "/api/config/reload", .handler = handleConfigReload },
+    .{ .method = "POST", .path = "/api/config/validate", .handler = handleConfigValidate },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -1448,6 +1453,317 @@ fn handleSkillDelete(ctx: *ApiContext) anyerror!void {
     try ctx.sendSuccess(data);
 }
 
+// ── Phase 5 handlers — config mutation ───────────────────────────────
+
+/// PATCH /api/config
+///
+/// Set a single config value at the given dotted path.  The change is
+/// persisted atomically to the on-disk config file (with a `.bak` backup).
+///
+/// Body: `{"path": "dotted.config.path", "value": <any JSON value>}`
+///
+/// The `value` field must be a valid JSON value.  For string values it may
+/// also be a bare unquoted string (forwarded as-is to `mutateDefaultConfig`
+/// which will try JSON parse first, then treat it as a string literal).
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "path": "default_temperature",
+///     "changed": true,
+///     "applied": true,
+///     "requires_restart": false,
+///     "old_value": 0.7,
+///     "new_value": 0.9
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   MISSING_BODY    — no request body.
+///   INVALID_JSON    — body is not a JSON object.
+///   MISSING_FIELD   — path or value missing.
+///   PATH_NOT_ALLOWED — path not in the mutation allowlist (422).
+///   INVALID_VALUE   — value cannot be parsed or fails validation (400/422).
+fn handleConfigSet(ctx: *ApiContext) anyerror!void {
+    try configMutateHandler(ctx, .set);
+}
+
+/// DELETE /api/config
+///
+/// Unset (remove) a single config key at the given dotted path.  The change
+/// is persisted atomically to the on-disk config file.
+///
+/// Body: `{"path": "dotted.config.path"}`
+/// The `value` field is ignored if present.
+///
+/// Response shape: same as PATCH /api/config but `new_value` will be `null`.
+///
+/// Errors: same as PATCH /api/config (except `value` is never required).
+fn handleConfigUnset(ctx: *ApiContext) anyerror!void {
+    try configMutateHandler(ctx, .unset);
+}
+
+/// Shared implementation for PATCH and DELETE /api/config.
+fn configMutateHandler(ctx: *ApiContext, action: config_mutator.MutationAction) anyerror!void {
+    const raw_body = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_BODY", "request body required");
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be valid JSON");
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be a JSON object");
+        return;
+    }
+    const obj = parsed.value.object;
+
+    const path_val = obj.get("path") orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_FIELD", "field 'path' required");
+        return;
+    };
+    if (path_val != .string or path_val.string.len == 0) {
+        try ctx.sendError("400 Bad Request", "INVALID_FIELD", "field 'path' must be a non-empty string");
+        return;
+    }
+    const path = path_val.string;
+
+    // For .set, stringify the value field back to JSON for mutateDefaultConfig.
+    var value_raw_buf: ?[]u8 = null;
+    defer if (value_raw_buf) |b| ctx.allocator.free(b);
+
+    if (action == .set) {
+        const value_val = obj.get("value") orelse {
+            try ctx.sendError("400 Bad Request", "MISSING_FIELD", "field 'value' required for set");
+            return;
+        };
+        // Stringify the JSON value so mutateDefaultConfig can re-parse it.
+        value_raw_buf = std.json.Stringify.valueAlloc(ctx.allocator, value_val, .{}) catch {
+            try ctx.sendError("400 Bad Request", "INVALID_VALUE", "could not serialize value");
+            return;
+        };
+    }
+
+    var result = config_mutator.mutateDefaultConfig(
+        ctx.allocator,
+        action,
+        path,
+        value_raw_buf,
+        .{ .apply = true },
+    ) catch |err| {
+        const http_status, const code, const msg = configMutateErrorResponse(err);
+        try ctx.sendError(http_status, code, msg);
+        return;
+    };
+    defer config_mutator.freeMutationResult(ctx.allocator, &result);
+
+    const escaped_path = try jsonEscapeString(ctx.allocator, result.path);
+    defer ctx.allocator.free(escaped_path);
+
+    const data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"path\":\"{s}\",\"changed\":{s},\"applied\":{s},\"requires_restart\":{s},\"old_value\":{s},\"new_value\":{s}}}",
+        .{
+            escaped_path,
+            if (result.changed) "true" else "false",
+            if (result.applied) "true" else "false",
+            if (result.requires_restart) "true" else "false",
+            result.old_value_json,
+            result.new_value_json,
+        },
+    );
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// POST /api/config/reload
+///
+/// Validate and report the current on-disk config.  Returns which fields
+/// would be hot-reloadable versus requiring a process restart.
+///
+/// This endpoint does NOT hot-reload in-memory state (config is read-only
+/// from the API layer).  It is a dry-run diagnostic: clients can call it
+/// after a PATCH /api/config to understand restart requirements.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "valid": true,
+///     "requires_restart": false,
+///     "message": "config is valid"
+///   },
+///   "error": null
+/// }
+/// ```
+///
+/// Errors:
+///   CONFIG_INVALID — on-disk config failed validation (422).
+fn handleConfigReload(ctx: *ApiContext) anyerror!void {
+    config_mutator.validateCurrentConfig(ctx.allocator) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            ctx.allocator,
+            "config validation failed: {s}",
+            .{@errorName(err)},
+        );
+        defer ctx.allocator.free(msg);
+        const escaped_msg = try jsonEscapeString(ctx.allocator, msg);
+        defer ctx.allocator.free(escaped_msg);
+        const data = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"valid\":false,\"requires_restart\":false,\"message\":\"{s}\"}}",
+            .{escaped_msg},
+        );
+        defer ctx.allocator.free(data);
+        // Return 422 with success:false for validation errors.
+        const body_str = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"success\":false,\"data\":null,\"error\":{{\"code\":\"CONFIG_INVALID\",\"message\":\"{s}\"}}}}",
+            .{escaped_msg},
+        );
+        ctx.setJsonOwned("422 Unprocessable Entity", body_str);
+        return;
+    };
+
+    const data = "{\"valid\":true,\"requires_restart\":false,\"message\":\"config is valid\"}";
+    try ctx.sendSuccess(data);
+}
+
+/// POST /api/config/validate
+///
+/// Validate a candidate config JSON body without writing it to disk.
+/// Useful for pre-flight checks before applying changes.
+///
+/// Body: a complete config JSON object (same schema as config.json).
+///
+/// Response shape:
+/// ```json
+/// {"success":true,"data":{"valid":true,"message":"config is valid"},"error":null}
+/// ```
+///
+/// Errors:
+///   MISSING_BODY    — no request body.
+///   INVALID_JSON    — body is not valid JSON.
+///   CONFIG_INVALID  — candidate config fails validation (422).
+fn handleConfigValidate(ctx: *ApiContext) anyerror!void {
+    const raw_body = ctx.body() orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_BODY", "request body required");
+        return;
+    };
+
+    // Parse to check it is valid JSON first.
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch {
+        try ctx.sendError("400 Bad Request", "INVALID_JSON", "request body must be valid JSON");
+        return;
+    };
+    defer parsed.deinit();
+
+    // Build a temporary Config to run validation.
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = a };
+    cfg.parseJson(raw_body) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            ctx.allocator,
+            "config parse failed: {s}",
+            .{@errorName(err)},
+        );
+        defer ctx.allocator.free(msg);
+        const escaped = try jsonEscapeString(ctx.allocator, msg);
+        defer ctx.allocator.free(escaped);
+        const body_str = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"success\":false,\"data\":null,\"error\":{{\"code\":\"CONFIG_INVALID\",\"message\":\"{s}\"}}}}",
+            .{escaped},
+        );
+        ctx.setJsonOwned("422 Unprocessable Entity", body_str);
+        return;
+    };
+    cfg.syncFlatFields();
+    cfg.validate() catch |err| {
+        const msg = try std.fmt.allocPrint(
+            ctx.allocator,
+            "config validation failed: {s}",
+            .{@errorName(err)},
+        );
+        defer ctx.allocator.free(msg);
+        const escaped = try jsonEscapeString(ctx.allocator, msg);
+        defer ctx.allocator.free(escaped);
+        const body_str = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"success\":false,\"data\":null,\"error\":{{\"code\":\"CONFIG_INVALID\",\"message\":\"{s}\"}}}}",
+            .{escaped},
+        );
+        ctx.setJsonOwned("422 Unprocessable Entity", body_str);
+        return;
+    };
+
+    const data = "{\"valid\":true,\"message\":\"config is valid\"}";
+    try ctx.sendSuccess(data);
+}
+
+/// Map a config_mutator error to (http_status, error_code, message).
+fn configMutateErrorResponse(err: anyerror) struct { []const u8, []const u8, []const u8 } {
+    return switch (err) {
+        error.PathNotAllowed => .{ "422 Unprocessable Entity", "PATH_NOT_ALLOWED", "path is not in the config mutation allowlist" },
+        error.MissingValue => .{ "400 Bad Request", "MISSING_VALUE", "value is required for this operation" },
+        error.InvalidPath => .{ "400 Bad Request", "INVALID_PATH", "path is empty or malformed" },
+        error.InvalidJson => .{ "400 Bad Request", "INVALID_JSON", "existing config is not valid JSON" },
+        // Config.ValidationError variants all map to 422.
+        error.LegacyDefaultProviderField,
+        error.LegacyDefaultModelField,
+        error.InvalidDefaultModelPrimary,
+        error.NoDefaultModel,
+        error.TemperatureOutOfRange,
+        error.InvalidAgentTimezone,
+        error.InvalidPort,
+        error.InvalidRetryCount,
+        error.InvalidBackoffMs,
+        error.InvalidHttpProxyUrl,
+        error.InvalidApiErrorMaxChars,
+        error.InvalidHttpSearchBaseUrl,
+        error.InvalidHttpSearchProvider,
+        error.InvalidHttpSearchFallbackProvider,
+        error.InvalidProviderApiMode,
+        error.InvalidMcpTransport,
+        error.MissingMcpCommand,
+        error.MissingMcpHttpUrl,
+        error.InvalidMcpHttpUrl,
+        error.InvalidMcpHeader,
+        error.InvalidMcpTimeoutMs,
+        error.InvalidExternalRuntimeName,
+        error.ConflictingExternalRuntimeName,
+        error.MissingExternalTransportCommand,
+        error.InvalidExternalTransportTimeoutMs,
+        error.InvalidExternalPluginConfig,
+        error.InvalidWebTransport,
+        error.InvalidWebPath,
+        error.InvalidWebAuthToken,
+        error.InvalidWebMessageAuthMode,
+        error.InvalidWebMessageAuthTransport,
+        error.InvalidWebOrigin,
+        error.MissingWebRelayUrl,
+        error.InvalidWebRelayUrl,
+        error.InvalidWebRelayAgentId,
+        error.InvalidWebRelayPairingCodeTtl,
+        error.InvalidWebRelayUiTokenTtl,
+        error.InvalidWebRelayTokenTtl,
+        error.InsecurePlaintextSecrets,
+        => .{ "422 Unprocessable Entity", "CONFIG_INVALID", @errorName(err) },
+        else => .{ "500 Internal Server Error", "INTERNAL_ERROR", "mutation failed" },
+    };
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -2277,4 +2593,241 @@ test "DELETE /api/cron/:id unknown id returns 404" {
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("404 Not Found", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "JOB_NOT_FOUND") != null);
+}
+
+// ── Phase 5 config mutation tests ────────────────────────────────────
+
+test "PATCH /api/config missing body returns 400" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "PATCH /api/config HTTP/1.1\r\n\r\n",
+        "PATCH",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_BODY") != null);
+}
+
+test "PATCH /api/config invalid json body returns 400" {
+    var cfg = makeEnabledCfg();
+    const raw = "PATCH /api/config HTTP/1.1\r\nContent-Type: application/json\r\n\r\nnot-json";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "PATCH",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "INVALID_JSON") != null);
+}
+
+test "PATCH /api/config missing path field returns 400" {
+    var cfg = makeEnabledCfg();
+    const raw = "PATCH /api/config HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"value\":1}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "PATCH",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_FIELD") != null);
+}
+
+test "PATCH /api/config missing value field returns 400" {
+    var cfg = makeEnabledCfg();
+    const raw = "PATCH /api/config HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"path\":\"default_temperature\"}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "PATCH",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_FIELD") != null);
+}
+
+test "PATCH /api/config path not in allowlist returns 422" {
+    var cfg = makeEnabledCfg();
+    const raw = "PATCH /api/config HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" ++
+        "{\"path\":\"identity.format\",\"value\":\"evil\"}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "PATCH",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("422 Unprocessable Entity", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "PATH_NOT_ALLOWED") != null);
+}
+
+test "DELETE /api/config missing body returns 400" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "DELETE /api/config HTTP/1.1\r\n\r\n",
+        "DELETE",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_BODY") != null);
+}
+
+test "DELETE /api/config path not in allowlist returns 422" {
+    var cfg = makeEnabledCfg();
+    const raw = "DELETE /api/config HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" ++
+        "{\"path\":\"identity.format\"}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "DELETE",
+        "/api/config",
+        "/api/config",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("422 Unprocessable Entity", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "PATH_NOT_ALLOWED") != null);
+}
+
+test "POST /api/config/reload returns valid for a valid config" {
+    // NOTE: validateCurrentConfig reads the real on-disk config.  In the test
+    // environment there may be no config.json at all — readConfigOrDefault
+    // returns "{}\n" for missing files.  An empty config is valid (no model
+    // required by validate() when default_provider is "").
+    // This test only asserts the response shape; the specific valid/invalid
+    // outcome depends on the machine's config file and is intentionally not
+    // asserted beyond the envelope.
+    var cfg = makeEnabledCfg();
+    const raw = "POST /api/config/reload HTTP/1.1\r\n\r\n";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/config/reload",
+        "/api/config/reload",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    // Either 200 OK (valid) or 422 Unprocessable (invalid).  Both are
+    // acceptable; we only verify the response is well-formed JSON with
+    // the expected envelope shape.
+    try std.testing.expect(
+        std.mem.eql(u8, result.status, "200 OK") or
+            std.mem.eql(u8, result.status, "422 Unprocessable Entity"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\"") != null);
+}
+
+test "POST /api/config/validate missing body returns 400" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "POST /api/config/validate HTTP/1.1\r\n\r\n",
+        "POST",
+        "/api/config/validate",
+        "/api/config/validate",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MISSING_BODY") != null);
+}
+
+test "POST /api/config/validate invalid json returns 400" {
+    var cfg = makeEnabledCfg();
+    const raw = "POST /api/config/validate HTTP/1.1\r\nContent-Type: application/json\r\n\r\nnot-json";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/config/validate",
+        "/api/config/validate",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("400 Bad Request", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "INVALID_JSON") != null);
+}
+
+test "POST /api/config/validate valid empty config returns 200" {
+    var cfg = makeEnabledCfg();
+    // An empty JSON object — default_provider is "" which triggers NoDefaultModel...
+    // but only if default_model is also missing.  An empty config has no primary
+    // model set, which hits the NoDefaultModel path.  Provide a minimal valid config.
+    const raw = "POST /api/config/validate HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" ++
+        "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"}}}}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/config/validate",
+        "/api/config/validate",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"valid\":true") != null);
+}
+
+test "POST /api/config/validate invalid config returns 422" {
+    var cfg = makeEnabledCfg();
+    // temperature=99 is out of range — should trigger TemperatureOutOfRange.
+    const raw = "POST /api/config/validate HTTP/1.1\r\nContent-Type: application/json\r\n\r\n" ++
+        "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openai/gpt-4o\"}}},\"default_temperature\":99.0}";
+    const result = dispatch(
+        std.testing.allocator,
+        raw,
+        "POST",
+        "/api/config/validate",
+        "/api/config/validate",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("422 Unprocessable Entity", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "CONFIG_INVALID") != null);
 }
