@@ -29,7 +29,9 @@ const config_mutator = @import("../config_mutator.zig");
 const cron_mod = @import("../cron.zig");
 const agent_routing = @import("../agent_routing.zig");
 const skillforge = @import("../skillforge.zig");
-const Config = @import("../config.zig").Config;
+const config_mod = @import("../config.zig");
+const Config = config_mod.Config;
+const McpServerConfig = config_mod.McpServerConfig;
 const ApiContext = @import("context.zig").ApiContext;
 
 // ── Endpoint registry ────────────────────────────────────────────────
@@ -66,6 +68,9 @@ pub const registry: []const Endpoint = &.{
     .{ .method = "GET", .path = "/api/skills", .handler = handleSkillList },
     .{ .method = "POST", .path = "/api/skills/install", .handler = handleSkillInstall },
     .{ .method = "DELETE", .path = "/api/skills/:name", .handler = handleSkillDelete },
+    // Phase 6 — MCP server management
+    .{ .method = "GET", .path = "/api/mcp", .handler = handleMcpList },
+    .{ .method = "GET", .path = "/api/mcp/:name", .handler = handleMcpGet },
 };
 
 // ── Dispatcher ───────────────────────────────────────────────────────
@@ -1448,6 +1453,149 @@ fn handleSkillDelete(ctx: *ApiContext) anyerror!void {
     try ctx.sendSuccess(data);
 }
 
+// ── Phase 6 handlers — MCP server management ─────────────────────────
+
+/// GET /api/mcp
+///
+/// Lists all MCP servers declared in the active config.
+///
+/// Returns name, transport, command (stdio) or url (http), arg count,
+/// env key names (values are redacted), header names (values are
+/// redacted), and timeout_ms.  Never exposes credential values.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "success": true,
+///   "data": [
+///     {
+///       "name": "context7",
+///       "transport": "stdio",
+///       "command": "npx",
+///       "url": null,
+///       "args_count": 2,
+///       "env_keys": ["OPENROUTER_API_KEY"],
+///       "header_names": [],
+///       "timeout_ms": 10000
+///     }
+///   ],
+///   "error": null
+/// }
+/// ```
+fn handleMcpList(ctx: *ApiContext) anyerror!void {
+    const cfg = ctx.config_opt.?;
+    const servers = cfg.mcp_servers;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ctx.allocator);
+    const w = buf.writer(ctx.allocator);
+
+    try w.writeByte('[');
+    for (servers, 0..) |srv, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeMcpServerSummary(&buf, ctx.allocator, srv);
+    }
+    try w.writeByte(']');
+
+    const data = try ctx.allocator.dupe(u8, buf.items);
+    defer ctx.allocator.free(data);
+    try ctx.sendSuccess(data);
+}
+
+/// GET /api/mcp/:name
+///
+/// Returns detail for a single MCP server by name.
+///
+/// Response shape: same object as one element of GET /api/mcp but with
+/// an additional `"args"` field listing the full argument list.
+///
+/// Errors:
+///   MCP_NOT_FOUND — no server with that name is configured.
+fn handleMcpGet(ctx: *ApiContext) anyerror!void {
+    const cfg = ctx.config_opt.?;
+    const name = ctx.path_param orelse {
+        try ctx.sendError("400 Bad Request", "MISSING_PARAM", "server name required in path");
+        return;
+    };
+
+    for (cfg.mcp_servers) |srv| {
+        if (!std.mem.eql(u8, srv.name, name)) continue;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(ctx.allocator);
+        const w = buf.writer(ctx.allocator);
+
+        // Write summary object then splice in the `args` array before the
+        // closing brace.  Easiest: build summary, strip trailing '}', append
+        // args, then close.
+        try writeMcpServerSummary(&buf, ctx.allocator, srv);
+        // Remove the trailing '}'.
+        if (buf.items.len > 0 and buf.items[buf.items.len - 1] == '}') {
+            buf.items.len -= 1;
+        }
+        // Append full args array.
+        try w.writeAll(",\"args\":[");
+        for (srv.args, 0..) |arg, j| {
+            if (j > 0) try w.writeByte(',');
+            try appendJsonString(&buf, ctx.allocator, arg);
+        }
+        try w.writeAll("]}");
+
+        const data = try ctx.allocator.dupe(u8, buf.items);
+        defer ctx.allocator.free(data);
+        try ctx.sendSuccess(data);
+        return;
+    }
+
+    try ctx.sendError("404 Not Found", "MCP_NOT_FOUND", "no MCP server with that name is configured");
+}
+
+/// Serialise a single McpServerConfig summary into `buf`.
+/// Env values and header values are redacted to avoid leaking credentials.
+fn writeMcpServerSummary(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    srv: McpServerConfig,
+) anyerror!void {
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    // name
+    try w.writeAll("\"name\":");
+    try appendJsonString(buf, allocator, srv.name);
+    // transport
+    try w.writeAll(",\"transport\":");
+    try appendJsonString(buf, allocator, srv.transport);
+    // command (empty string when http transport)
+    try w.writeAll(",\"command\":");
+    try appendJsonString(buf, allocator, srv.command);
+    // url (null when stdio transport)
+    if (srv.url) |u| {
+        try w.writeAll(",\"url\":");
+        try appendJsonString(buf, allocator, u);
+    } else {
+        try w.writeAll(",\"url\":null");
+    }
+    // args_count
+    try w.print(",\"args_count\":{d}", .{srv.args.len});
+    // env_keys — names only, values redacted
+    try w.writeAll(",\"env_keys\":[");
+    for (srv.env, 0..) |entry, k| {
+        if (k > 0) try w.writeByte(',');
+        try appendJsonString(buf, allocator, entry.key);
+    }
+    try w.writeByte(']');
+    // header_names — names only, values redacted
+    try w.writeAll(",\"header_names\":[");
+    for (srv.headers, 0..) |entry, k| {
+        if (k > 0) try w.writeByte(',');
+        try appendJsonString(buf, allocator, entry.key);
+    }
+    try w.writeByte(']');
+    // timeout_ms
+    try w.print(",\"timeout_ms\":{d}", .{srv.timeout_ms});
+    try w.writeByte('}');
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 fn makeEnabledCfg() Config {
     var cfg = Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator };
@@ -2277,4 +2425,172 @@ test "DELETE /api/cron/:id unknown id returns 404" {
     defer if (result.allocated) std.testing.allocator.free(result.body);
     try std.testing.expectEqualStrings("404 Not Found", result.status);
     try std.testing.expect(std.mem.indexOf(u8, result.body, "JOB_NOT_FOUND") != null);
+}
+
+// ── Phase 6 MCP tests ─────────────────────────────────────────────────
+
+test "GET /api/mcp returns empty array when no mcp servers configured" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp",
+        "/api/mcp",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"data\":[]") != null);
+}
+
+test "GET /api/mcp lists configured mcp servers" {
+    const env_entries = [_]McpServerConfig.McpEnvEntry{
+        .{ .key = "OPENROUTER_API_KEY", .value = "secret-key-value" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "context7",
+            .transport = "stdio",
+            .command = "npx",
+            .args = &.{ "-y", "@upstash/context7-mcp" },
+            .env = &env_entries,
+            .timeout_ms = 10_000,
+        },
+    };
+    var cfg = makeEnabledCfg();
+    cfg.mcp_servers = &mcp_servers;
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp",
+        "/api/mcp",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"name\":\"context7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"transport\":\"stdio\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"command\":\"npx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"args_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"OPENROUTER_API_KEY\"") != null);
+    // Secret value must not appear in the response.
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "secret-key-value") == null);
+}
+
+test "GET /api/mcp lists http transport server" {
+    const header_entries = [_]McpServerConfig.McpHeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer super-secret" },
+    };
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "remote-mcp",
+            .transport = "http",
+            .command = "",
+            .url = "https://mcp.example.com/rpc",
+            .headers = &header_entries,
+            .timeout_ms = 30_000,
+        },
+    };
+    var cfg = makeEnabledCfg();
+    cfg.mcp_servers = &mcp_servers;
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp",
+        "/api/mcp",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"name\":\"remote-mcp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"transport\":\"http\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"url\":\"https://mcp.example.com/rpc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"header_names\":[\"Authorization\"]") != null);
+    // Header value must not appear.
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "super-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"timeout_ms\":30000") != null);
+}
+
+test "GET /api/mcp/:name returns 404 for unknown server" {
+    var cfg = makeEnabledCfg();
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp/nonexistent HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp/nonexistent",
+        "/api/mcp/nonexistent",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("404 Not Found", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "MCP_NOT_FOUND") != null);
+}
+
+test "GET /api/mcp/:name returns server detail with args" {
+    const mcp_servers = [_]McpServerConfig{
+        .{
+            .name = "context7",
+            .transport = "stdio",
+            .command = "npx",
+            .args = &.{ "-y", "@upstash/context7-mcp" },
+            .timeout_ms = 10_000,
+        },
+    };
+    var cfg = makeEnabledCfg();
+    cfg.mcp_servers = &mcp_servers;
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp/context7 HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp/context7",
+        "/api/mcp/context7",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"name\":\"context7\"") != null);
+    // Detail response must include the full args array.
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"args\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"-y\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"@upstash/context7-mcp\"") != null);
+}
+
+test "GET /api/mcp/:name url null for stdio server" {
+    const mcp_servers = [_]McpServerConfig{
+        .{ .name = "fs-server", .command = "npx", .transport = "stdio" },
+    };
+    var cfg = makeEnabledCfg();
+    cfg.mcp_servers = &mcp_servers;
+
+    const result = dispatch(
+        std.testing.allocator,
+        "GET /api/mcp/fs-server HTTP/1.1\r\n\r\n",
+        "GET",
+        "/api/mcp/fs-server",
+        "/api/mcp/fs-server",
+        &cfg,
+        true,
+        null,
+    );
+    defer if (result.allocated) std.testing.allocator.free(result.body);
+    try std.testing.expectEqualStrings("200 OK", result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.body, "\"url\":null") != null);
 }
