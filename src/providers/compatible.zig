@@ -49,6 +49,21 @@ fn returnLoggedCompatibleApiError(
     return err;
 }
 
+fn mapTransportProbeError(err: anyerror) anyerror {
+    return switch (err) {
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTimeout,
+        error.CurlTlsError,
+        error.CurlReadError,
+        error.CurlWriteError,
+        error.CurlWaitError,
+        error.CurlFailed,
+        => err,
+        else => error.CompatibleApiError,
+    };
+}
+
 fn parseStatusCodeValue(value: std.json.Value) ?u16 {
     return switch (value) {
         .integer => |i| blk: {
@@ -836,7 +851,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return mapTransportProbeError(err);
         defer allocator.free(resp_body);
 
         return parseResponsesResponse(allocator, resp_body) catch |err| {
@@ -1475,7 +1490,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return mapTransportProbeError(err);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
@@ -1567,7 +1582,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return mapTransportProbeError(err);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
@@ -2577,6 +2592,13 @@ test "returnLoggedCompatibleApiError preserves fallback error" {
             "{\"error\":{\"message\":\"Too many requests\",\"status\":429}}",
         ),
     );
+}
+
+test "mapTransportProbeError preserves curl transport failures" {
+    try std.testing.expect(mapTransportProbeError(error.CurlTimeout) == error.CurlTimeout);
+    try std.testing.expect(mapTransportProbeError(error.CurlConnectError) == error.CurlConnectError);
+    try std.testing.expect(mapTransportProbeError(error.CurlDnsError) == error.CurlDnsError);
+    try std.testing.expect(mapTransportProbeError(error.ApiError) == error.CompatibleApiError);
 }
 
 test "responsesUrl requires exact suffix match" {
