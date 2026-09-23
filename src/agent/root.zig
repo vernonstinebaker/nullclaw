@@ -10250,6 +10250,7 @@ test "Agent retries empty final response once before succeeding" {
     const EmptyThenRecoveredProvider = struct {
         call_count: usize = 0,
         saw_empty_retry_prompt: bool = false,
+        saw_web_search_lecture: bool = false,
 
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
             return allocator.dupe(u8, "");
@@ -10271,6 +10272,7 @@ test "Agent retries empty final response once before succeeding" {
             for (request.messages) |msg| {
                 if (msg.role == .user and std.mem.indexOf(u8, msg.content, "previous reply was empty") != null) {
                     self.saw_empty_retry_prompt = true;
+                    if (std.mem.indexOf(u8, msg.content, "web_search") != null) self.saw_web_search_lecture = true;
                 }
             }
 
@@ -10334,6 +10336,7 @@ test "Agent retries empty final response once before succeeding" {
     try std.testing.expectEqualStrings("recovered", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_empty_retry_prompt);
+    try std.testing.expect(!provider_state.saw_web_search_lecture);
 }
 
 test "Agent returns NoResponseContent after repeated empty final responses" {
@@ -10442,6 +10445,335 @@ test "ordinary turns omit unrelated mcp tool schemas" {
     try std.testing.expectEqual(@as(usize, 2), matched.len);
     try std.testing.expectEqualStrings("file_read", matched[0].name);
     try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", matched[1].name);
+}
+
+test "turn omits unrelated mcp tools from the provider request" {
+    const RecordingProvider = struct {
+        const Self = @This();
+        saw_file_read: bool = false,
+        saw_vikunja: bool = false,
+        saw_weather: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (request.tools) |tools| {
+                for (tools) |spec| {
+                    if (std.mem.eql(u8, spec.name, "file_read")) self.saw_file_read = true;
+                    if (std.mem.eql(u8, spec.name, "mcp_vikunja_list_tasks")) self.saw_vikunja = true;
+                    if (std.mem.eql(u8, spec.name, "mcp_weather_forecast")) self.saw_weather = true;
+                }
+            }
+            return .{
+                .content = try allocator.dupe(u8, "pong"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "recording-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = RecordingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RecordingProvider.chatWithSystem,
+        .chat = RecordingProvider.chat,
+        .supportsNativeTools = RecordingProvider.supportsNativeTools,
+        .getName = RecordingProvider.getName,
+        .deinit = RecordingProvider.deinitFn,
+    };
+    const specs = try allocator.alloc(ToolSpec, 3);
+    specs[0] = .{ .name = "file_read", .description = "read", .parameters_json = "{}" };
+    specs[1] = .{ .name = "mcp_vikunja_list_tasks", .description = "tasks", .parameters_json = "{}" };
+    specs[2] = .{ .name = "mcp_weather_forecast", .description = "weather", .parameters_json = "{}" };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("Reply with exactly the word pong");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("pong", response);
+    try std.testing.expect(provider_state.saw_file_read);
+    try std.testing.expect(!provider_state.saw_vikunja);
+    try std.testing.expect(!provider_state.saw_weather);
+}
+
+test "turn blocks a write after web_search in the same turn" {
+    const SearchThenWriteProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        second_request_has_file_write: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 2);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-search"),
+                    .name = try allocator.dupe(u8, "web_search"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                tool_calls[1] = .{
+                    .id = try allocator.dupe(u8, "call-write"),
+                    .name = try allocator.dupe(u8, "file_write"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            if (request.tools) |tools| {
+                for (tools) |spec| {
+                    if (std.mem.eql(u8, spec.name, "file_write")) self.second_request_has_file_write = true;
+                }
+            }
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "search-then-write";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var search_count: usize = 0;
+    var write_count: usize = 0;
+    const SearchTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "web_search";
+        pub const tool_description = "search";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "outside page" };
+        }
+    };
+    const WriteTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "file_write";
+        pub const tool_description = "write";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "wrote" };
+        }
+    };
+    var search_tool = SearchTool{ .count = &search_count };
+    var write_tool = WriteTool{ .count = &write_count };
+    const tool_list = [_]Tool{ search_tool.tool(), write_tool.tool() };
+    const specs = try allocator.alloc(ToolSpec, 2);
+    specs[0] = .{ .name = "web_search", .description = "search", .parameters_json = "{}" };
+    specs[1] = .{ .name = "file_write", .description = "write", .parameters_json = "{}" };
+
+    var provider_state = SearchThenWriteProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SearchThenWriteProvider.chatWithSystem,
+        .chat = SearchThenWriteProvider.chat,
+        .supportsNativeTools = SearchThenWriteProvider.supportsNativeTools,
+        .getName = SearchThenWriteProvider.getName,
+        .deinit = SearchThenWriteProvider.deinitFn,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("search then save");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 1), search_count);
+    try std.testing.expectEqual(@as(usize, 0), write_count);
+    try std.testing.expect(!provider_state.second_request_has_file_write);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "streaming turn compacts and retries after context exhaustion" {
+    const StreamingRecoveryProvider = struct {
+        const Self = @This();
+        calls: u32 = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldUseStreamChat;
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return error.ContextLengthExceeded;
+            const content = try allocator.dupe(u8, "recovered");
+            callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = content,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-recovery";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamCollector = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+            }
+        }
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.chunks.deinit(allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingRecoveryProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingRecoveryProvider.chatWithSystem,
+        .chat = StreamingRecoveryProvider.chat,
+        .supportsNativeTools = StreamingRecoveryProvider.supportsNativeTools,
+        .getName = StreamingRecoveryProvider.getName,
+        .deinit = StreamingRecoveryProvider.deinitFn,
+        .supports_streaming = StreamingRecoveryProvider.supportsStreaming,
+        .stream_chat = StreamingRecoveryProvider.streamChat,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+    try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
+    for (0..7) |idx| {
+        const content = try std.fmt.allocPrint(allocator, "m{d}", .{idx});
+        try agent.history.append(allocator, .{
+            .role = if (idx % 2 == 0) .user else .assistant,
+            .content = content,
+        });
+    }
+    var collector = StreamCollector{};
+    defer collector.deinit(allocator);
+    agent.stream_callback = StreamCollector.callback;
+    agent.stream_ctx = @ptrCast(&collector);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "[Context compacted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "recovered") != null);
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
 }
 
 test "Agent retries empty streaming response once" {

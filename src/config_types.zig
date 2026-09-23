@@ -1998,6 +1998,11 @@ pub const SessionConfig = struct {
     max_concurrent_tasks: u32 = 4,
 };
 
+test "AgentConfig tool round default is 32" {
+    const cfg = AgentConfig{};
+    try std.testing.expectEqual(@as(u32, 32), cfg.max_tool_iterations);
+}
+
 test "WebConfig defaults" {
     const cfg = WebConfig{};
     try std.testing.expectEqualStrings("default", cfg.account_id);
