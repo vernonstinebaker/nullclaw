@@ -2,9 +2,26 @@
 
 Review began at `82c88e8d8fdc17268aa24ee713c0ee0cba78a797` and was updated through `10231364fb58628dfd7c429afe5eba0a17289773` after concurrent commits arrived. Particular attention went to `6a1b5466` (loop hygiene), streaming tool execution, compaction, replay caching, and turn persistence. This is a focused source review of the agent engine and its immediate boundaries, not an exhaustive audit of every provider, channel, or tool. No repository source or configuration was changed by this review. Source locations below refer to the final reviewed commit.
 
+## Resolution status (updated 2026-09-23, after `90e4b01c`)
+
+**All nine findings and every item in "Additional hardening opportunities" below are resolved.** The fixes landed in commit `90e4b01c`, which implemented hardening phases 1–8 of [PLAN.md](../../PLAN.md) — see its progress ledger and validation ledger for the per-phase test evidence (final suite at that tree: 7,533 passed / 9 skipped). Line references in the findings point at the reviewed snapshot `10231364` and have moved; locate symbols by name. The external-content write-lock design concern raised near the end was settled by decision D6 in PLAN.md (lock retained, documented limits, boundary tests).
+
+| Finding | Resolved by |
+|---|---|
+| 1 — tool identity / session exec policy | Phase 1 |
+| 2, 3 — parallel worker ownership and joins | Phase 2 |
+| 4, 5 — default output fidelity, stack lifetime | Phase 3 |
+| 7 — exact replay identity, guard gaps | Phase 4 |
+| 6 — response-cache eligibility and keying | Phase 5 |
+| 9 — turn finalization and allocation cleanup | Phase 6 |
+| 8 — MCP availability, external-content policy | Phase 7 |
+| Hardening items (canonical fingerprints, veto counting, cap bytes, scoped response cleanup, atomic fixtures, replay memory bounds, routed-model summary) | Phases 2–8 |
+
 ## Findings
 
 ### 1. P1 — Normalized tool lookup can bypass session exec restrictions
+
+> Resolved at `90e4b01c` (hardening phase 1): policy now uses the resolved registered tool name.
 
 `src/agent/root.zig:3564–3601`; `src/agent/commands.zig:5308–5317`; `src/agent/dispatcher.zig:379–385`.
 
@@ -14,6 +31,8 @@ Use the resolved registered tool name for policy decisions and execution identit
 
 ### 2. P1 — Parallel workers allocate into a shared, unsynchronized arena
 
+> Resolved at `90e4b01c` (hardening phase 2): worker-owned results transfer to the turn arena only after all joins.
+
 `src/agent/root.zig:3300–3314`, `3419–3423`.
 
 Every worker receives the same iteration arena and concurrently calls `parent_arena.dupe`. ArenaAllocator mutates its own allocation metadata without locking; thread safety of its backing allocator does not make the arena thread-safe. Concurrent completions can overlap result storage or corrupt arena state. The existing mutex protects only `checkToolPolicyGate`.
@@ -22,6 +41,8 @@ Keep result ownership inside each worker until all workers have joined, then tra
 
 ### 3. P1 — Parallel error exits leave workers running against expired storage
 
+> Resolved at `90e4b01c` (hardening phase 2): started/joined tracking joins every started worker on partial spawn failure.
+
 `src/agent/root.zig:3417–3429`.
 
 If a later `Thread.spawn` fails, earlier workers are never joined. Similarly, returning after observing one worker's error skips joining the remaining workers. Unwinding can free the iteration arena, parsed calls, worker contexts, and stack mutex while those workers still use them.
@@ -29,6 +50,8 @@ If a later `Thread.spawn` fails, earlier workers are never joined. Similarly, re
 Track the number of started threads and install unconditional join cleanup immediately. Join all workers before propagating any worker error. Cover partial spawn failure and output-allocation failure with deterministic injection. This is separate from the shared-arena race and needs its own regression coverage.
 
 ### 4. P1 — Default output compression changes the evidence supplied to the model
+
+> Resolved at `90e4b01c` (hardening phase 3): default output is lossless; lossy tail compression is explicit and scoped to log-style results.
 
 `src/agent/root.zig:3070–3089`; `src/agent/result_compress.zig:25–80`.
 
@@ -40,6 +63,8 @@ Isolated probes against copied source reproduced both indentation loss and remov
 
 ### 5. P1 — Error-signature matching reads a returned stack slice
 
+> Resolved at `90e4b01c` (hardening phase 3): the returned-slice helper was removed for caller-owned storage/direct search.
+
 `src/agent/result_compress.zig:88–105`.
 
 `stackLowerAscii` returns a slice into its local `[256]u8` buffer. `extractErrorSignature` reads that slice after the helper returns. This is a dangling reference; inlining can conceal it in some builds. A probe forcing a real function call reproduced corrupted contents.
@@ -47,6 +72,8 @@ Isolated probes against copied source reproduced both indentation loss and remov
 Place the buffer in the caller, return a value struct containing the buffer and length, or use a direct case-insensitive search. The separate 180-byte signature truncation should also preserve UTF-8 boundaries.
 
 ### 6. P1 — Enabled response caching can skip requested actions and reuse stale context
+
+> Resolved at `90e4b01c` (hardening phase 5): eligibility fixed before lookup — no tools, no memory, no conversation context, single user message; default remains disabled.
 
 `src/agent/root.zig:2284–2293`, `2704–2714`; `src/memory/lifecycle/cache.zig:98–119`.
 
@@ -56,6 +83,8 @@ Response caching is disabled by default, which limits default exposure. Keep it 
 
 ### 7. P2 — Signature-based tool replay caching returns stale reads after writes
 
+> Resolved at `90e4b01c` (hardening phase 4): no-ID calls execute again; native replay requires exact id + name + arguments.
+
 `src/agent/root.zig:2967–2981`, `3000–3035`, `3136–3144`.
 
 Calls without native IDs are deduplicated for the entire turn by name and raw argument string. A successful `file_read(path)` followed by `file_write(path)` and then the same read returns the first read's cached output. This undermines read-edit-verify loops, especially on the XML fallback path. Repeated polling can similarly stop observing external changes.
@@ -63,6 +92,8 @@ Calls without native IDs are deduplicated for the entire turn by name and raw ar
 Separate exact replay identity from intentional repeated calls. Preserve validated native-ID replay protection, but avoid caching arbitrary successful no-ID calls across state changes. Add a read/write/read test and repeated polling test. Validate that a reused native ID still has the same tool name and arguments before treating it as an exact replay.
 
 ### 8. P2 — MCP narrowing overrides configured always-on tools and loses follow-up context
+
+> Resolved at `90e4b01c` (hardening phase 7): explicit `tool_filter_groups` are authoritative; lexical narrowing runs only when no groups are configured (documented in docs/en/mcp.md).
 
 `src/agent/root.zig:2017–2040`, `2345–2351`.
 
@@ -72,6 +103,8 @@ Honor explicit always groups, preserve the relevant prior tool set for follow-up
 
 ### 9. P2 — Loop-guard termination bypasses normal history finalization
 
+> Resolved at `90e4b01c` (hardening phase 6): guard stops commit completed/skipped results and the stop text; shared finalization path.
+
 `src/agent/root.zig:2743`, `2758–2768`, `3485–3488`; `src/agent/turn_persistence.zig:11–15`.
 
 The assistant's tool-call message is appended before execution. A force-reply exits immediately, before recording collected results or adding the guard's final reply. The last history entry remains the tool-call assistant message. Persistence chooses that last assistant entry over the actual returned guard reply, so a restored session can contain the attempted tool call as its answer instead of the stop explanation. Earlier tools in a mixed batch may already have executed, but their results are lost from history.
@@ -79,6 +112,8 @@ The assistant's tool-call message is appended before execution. A force-reply ex
 Finalize completed/skipped tool results and append the stop response before returning. Prefer a shared finalization path for normal completion, interruption, iteration exhaustion, and guard termination. Test both immediate termination and termination after a successful earlier tool in the batch, then persist and reload.
 
 ## Additional hardening opportunities
+
+> All items in this section were also resolved at `90e4b01c` (phases 2–8); see the banner above and PLAN.md's validation ledger.
 
 - Loop fingerprints hash raw JSON, so argument key reordering or insignificant whitespace evades repetition counting. The isolated probe confirms this. Normalize parsed arguments if the guard is intended to detect equivalent calls, while preserving distinction between actual values. Alternating already-vetoed calls also resets consecutive veto tracking. Treat this as a bounded-run quality improvement, not a security boundary; the iteration cap remains in place.
 - An explicitly small `max_result_chars` can be exceeded by the truncation marker itself. A cap of 1 produces more than 1 byte. An isolated probe confirms this.
