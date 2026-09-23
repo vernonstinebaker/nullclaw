@@ -246,7 +246,7 @@ Upstream `nullclaw/nullclaw` is dormant (no maintainer merges since 2026-04-17; 
 **Deferred / rejected (do not intake without a new user decision):**
 
 - **#969** (approval flow, +11k lines): target region rewritten in `90e4b01c`; merging is now a re-implementation. Keep as a *design reference* only.
-- **#980**: redundant — our merged #959 already persists the paired token encrypted (verified in `src/gateway.zig` / `src/cron.zig`).
+- **#980**: redundant — our merged #959 already persists the paired token encrypted (verified in `src/gateway.zig` / `src/cron.zig`). Redundancy note left upstream 2026-09-23 (PR since closed silently): [comment](https://github.com/nullclaw/nullclaw/pull/980#issuecomment-5797867071). All 15 resolved PRs now carry a public provenance comment.
 - Tier 3 (opportunistic, no urgency): #990 Eden AI provider, #956 alpine bump, #958 Teams JWT fix, #968 Matrix persistence, #981 grok-cli, #775 CLAUDE.md dedup, #774 doc stats.
 - Tier 4 (do not take): #319 DingTalk recall, #667 email/IMAP channel, #411 tool customization (this tree's `tool_filter_groups` cover the need), #982/#983 proxy transports, #989 README chart, #527 megapr (+617k lines).
 
