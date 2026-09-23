@@ -300,6 +300,9 @@ pub const Agent = struct {
     /// Models auto-detected as not supporting vision (built at runtime).
     detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
+    /// Set for the rest of a turn after a tool returns outside content.
+    /// Write and command tools stay hidden until the next user message.
+    external_tools_locked: bool = false,
     max_history_messages: u32,
     auto_save: bool,
     compact_context: bool = true,
@@ -1953,10 +1956,88 @@ pub const Agent = struct {
         return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
     }
 
+    const EMPTY_RESPONSE_RETRY = "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or the necessary tool call. Do not return an empty response.";
+
+    fn isExternalContentTool(name: []const u8) bool {
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        return std.ascii.eqlIgnoreCase(trimmed, "web_search") or
+            std.ascii.eqlIgnoreCase(trimmed, "web_fetch") or
+            std.ascii.eqlIgnoreCase(trimmed, "http") or
+            std.ascii.eqlIgnoreCase(trimmed, "browser") or
+            std.ascii.eqlIgnoreCase(trimmed, "browser_open");
+    }
+
+    fn isMutatingTool(name: []const u8) bool {
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        return std.ascii.eqlIgnoreCase(trimmed, "shell") or
+            std.ascii.eqlIgnoreCase(trimmed, "file_write") or
+            std.ascii.eqlIgnoreCase(trimmed, "file_edit") or
+            std.ascii.eqlIgnoreCase(trimmed, "file_edit_hashed") or
+            std.ascii.eqlIgnoreCase(trimmed, "file_append") or
+            std.ascii.eqlIgnoreCase(trimmed, "git_operations");
+    }
+
+    fn batchHasExternalContentTool(calls: []const ParsedToolCall) bool {
+        for (calls) |call| {
+            if (isExternalContentTool(call.name)) return true;
+        }
+        return false;
+    }
+
+    fn dropMutatingToolSpecs(arena: std.mem.Allocator, specs: []const ToolSpec) ![]const ToolSpec {
+        var kept: std.ArrayListUnmanaged(ToolSpec) = .empty;
+        for (specs) |spec| {
+            if (isMutatingTool(spec.name)) continue;
+            try kept.append(arena, spec);
+        }
+        return kept.toOwnedSlice(arena);
+    }
+
+    fn dispatchChat(
+        self: *Agent,
+        messages: []const ChatMessage,
+        model_name: []const u8,
+        max_tokens: ?u32,
+        tools: ?[]const ToolSpec,
+        include_reasoning: bool,
+        streaming: bool,
+    ) !ChatResponse {
+        const request = providers.ChatRequest{
+            .messages = messages,
+            .session_id = self.memory_session_id,
+            .model = model_name,
+            .temperature = self.temperature,
+            .max_tokens = max_tokens,
+            .tools = tools,
+            .timeout_secs = self.message_timeout_secs,
+            .reasoning_effort = self.reasoning_effort,
+            .include_reasoning = include_reasoning,
+        };
+        if (!streaming) {
+            return self.provider.chat(self.allocator, request, model_name, self.temperature);
+        }
+        const streamed = try self.provider.streamChat(
+            self.allocator,
+            request,
+            model_name,
+            self.temperature,
+            self.stream_callback.?,
+            self.stream_ctx.?,
+        );
+        return .{
+            .content = streamed.content,
+            .reasoning_content = streamed.reasoning_content,
+            .tool_calls = streamed.tool_calls,
+            .usage = streamed.usage,
+            .model = streamed.model,
+        };
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        self.external_tools_locked = false;
         self.turn_loop_guard.reset();
         commands.refreshSubagentToolContext(self);
 
@@ -2196,6 +2277,7 @@ pub const Agent = struct {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
             }
+            self.trimHistory();
 
             // Drain any mid-turn injection at each tool boundary.
             if (try self.drainPendingInjection()) |injected| {
@@ -2215,7 +2297,10 @@ pub const Agent = struct {
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
-            const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
+            var turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
+            if (self.external_tools_locked) {
+                turn_tool_specs = try dropMutatingToolSpecs(arena, turn_tool_specs);
+            }
             const priority_tool = self.priorityToolForSpecsMessage(turn_tool_specs, effective_user_message);
 
             // Build messages slice for provider (arena-owned; freed at end of iteration).
@@ -2227,147 +2312,54 @@ pub const Agent = struct {
                 turn_max_tokens,
             );
 
-            // Call provider: streaming (native tools only when parser-supported) or blocking with retry
+            // One provider call for streaming and blocking. Retries stay here.
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
-            if (is_streaming) {
-                self.recordLlmRequestEvent(turn_model_name, messages);
-                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
-                const stream_result = self.provider.streamChat(
-                    self.allocator,
-                    .{
-                        .messages = messages,
-                        .session_id = self.memory_session_id,
-                        .model = turn_model_name,
-                        .temperature = self.temperature,
-                        .max_tokens = request_max_tokens,
-                        .tools = if (native_tools_enabled) turn_tool_specs else null,
-                        .timeout_secs = self.message_timeout_secs,
-                        .reasoning_effort = self.reasoning_effort,
-                        .include_reasoning = include_reasoning,
-                    },
-                    turn_model_name,
-                    self.temperature,
-                    self.stream_callback.?,
-                    self.stream_ctx.?,
-                ) catch |err| retry_stream: {
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
-                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
+            const tools_for_request: ?[]const ToolSpec = if (native_tools_enabled) turn_tool_specs else null;
+            self.recordLlmRequestEvent(turn_model_name, messages);
+            self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, is_streaming);
+            response = self.dispatchChat(
+                messages,
+                turn_model_name,
+                request_max_tokens,
+                tools_for_request,
+                include_reasoning,
+                is_streaming,
+            ) catch |err| retry_blk: {
+                const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
-                    // Auto-disable vision on first "model does not support vision" error
-                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
-                        if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
-                        }
-                        try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
-                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
-                            retry_msgs,
-                            if (native_tools_enabled) turn_tool_specs else null,
-                            turn_token_limit,
-                            turn_max_tokens,
-                        );
-                        response_attempt = 2;
-                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
-                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
-                        break :retry_stream self.provider.streamChat(
-                            self.allocator,
-                            .{
-                                .messages = retry_msgs,
-                                .session_id = self.memory_session_id,
-                                .model = turn_model_name,
-                                .temperature = self.temperature,
-                                .max_tokens = retry_max_tokens,
-                                .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                                .include_reasoning = include_reasoning,
-                            },
-                            turn_model_name,
-                            self.temperature,
-                            self.stream_callback.?,
-                            self.stream_ctx.?,
-                        ) catch |retry_err| {
-                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
-                            self.emitUsageFailure(turn_model_name);
-                            return retry_err;
-                        };
+                if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                    if (self.verbose_level == .on or self.verbose_level == .full) {
+                        log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                     }
+                    try self.markVisionDisabled(turn_model_name);
+                    const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
+                    const retry_max_tokens = self.effectiveMaxTokensForTurn(
+                        retry_msgs,
+                        tools_for_request,
+                        turn_token_limit,
+                        turn_max_tokens,
+                    );
+                    response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, retry_msgs);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, is_streaming);
+                    break :retry_blk self.dispatchChat(
+                        retry_msgs,
+                        turn_model_name,
+                        retry_max_tokens,
+                        tools_for_request,
+                        include_reasoning,
+                        is_streaming,
+                    ) catch |retry_err| {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                        self.emitUsageFailure(turn_model_name);
+                        return retry_err;
+                    };
+                }
 
-                    if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
-                    self.emitUsageFailure(turn_model_name);
-                    return err;
-                };
-                response = ChatResponse{
-                    .content = stream_result.content,
-                    .reasoning_content = stream_result.reasoning_content,
-                    .tool_calls = stream_result.tool_calls,
-                    .usage = stream_result.usage,
-                    .model = stream_result.model,
-                };
-            } else {
-                self.recordLlmRequestEvent(turn_model_name, messages);
-                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
-                response = self.provider.chat(
-                    self.allocator,
-                    .{
-                        .messages = messages,
-                        .session_id = self.memory_session_id,
-                        .model = turn_model_name,
-                        .temperature = self.temperature,
-                        .max_tokens = request_max_tokens,
-                        .tools = if (native_tools_enabled) turn_tool_specs else null,
-                        .timeout_secs = self.message_timeout_secs,
-                        .reasoning_effort = self.reasoning_effort,
-                        .include_reasoning = include_reasoning,
-                    },
-                    turn_model_name,
-                    self.temperature,
-                ) catch |err| retry_blk: {
-                    // Record the failed attempt
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
-                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
-
-                    // Auto-disable vision on first "model does not support vision" error
-                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
-                        if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
-                        }
-                        try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
-                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
-                            retry_msgs,
-                            if (native_tools_enabled) turn_tool_specs else null,
-                            turn_token_limit,
-                            turn_max_tokens,
-                        );
-                        response_attempt = 2;
-                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
-                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
-                        break :retry_blk self.provider.chat(
-                            self.allocator,
-                            .{
-                                .messages = retry_msgs,
-                                .session_id = self.memory_session_id,
-                                .model = turn_model_name,
-                                .temperature = self.temperature,
-                                .max_tokens = retry_max_tokens,
-                                .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                                .include_reasoning = include_reasoning,
-                            },
-                            turn_model_name,
-                            self.temperature,
-                        ) catch |retry_err| {
-                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
-                            self.emitUsageFailure(turn_model_name);
-                            return retry_err;
-                        };
-                    }
-
-                    // Context exhaustion: compact immediately before first retry
+                if (!is_streaming) {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
@@ -2377,28 +2369,20 @@ pub const Agent = struct {
                         const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
                         const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
-                            if (native_tools_enabled) turn_tool_specs else null,
+                            tools_for_request,
                             turn_token_limit,
                             turn_max_tokens,
                         );
                         response_attempt = 2;
                         self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
-                        break :retry_blk self.provider.chat(
-                            self.allocator,
-                            .{
-                                .messages = recovery_msgs,
-                                .session_id = self.memory_session_id,
-                                .model = turn_model_name,
-                                .temperature = self.temperature,
-                                .max_tokens = recovery_max_tokens,
-                                .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                                .include_reasoning = include_reasoning,
-                            },
+                        break :retry_blk self.dispatchChat(
+                            recovery_msgs,
                             turn_model_name,
-                            self.temperature,
+                            recovery_max_tokens,
+                            tools_for_request,
+                            include_reasoning,
+                            false,
                         ) catch |retry_after_compact_err| {
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                             self.emitUsageFailure(turn_model_name);
@@ -2412,56 +2396,37 @@ pub const Agent = struct {
                         return err;
                     }
 
-                    // Retry once
                     std_compat.thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
                     self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
-                    break :retry_blk self.provider.chat(
-                        self.allocator,
-                        .{
-                            .messages = messages,
-                            .session_id = self.memory_session_id,
-                            .model = turn_model_name,
-                            .temperature = self.temperature,
-                            .max_tokens = request_max_tokens,
-                            .tools = if (native_tools_enabled) turn_tool_specs else null,
-                            .timeout_secs = self.message_timeout_secs,
-                            .reasoning_effort = self.reasoning_effort,
-                            .include_reasoning = include_reasoning,
-                        },
+                    break :retry_blk self.dispatchChat(
+                        messages,
                         turn_model_name,
-                        self.temperature,
+                        request_max_tokens,
+                        tools_for_request,
+                        include_reasoning,
+                        false,
                     ) catch |retry_err| {
-                        // Context exhaustion recovery: if we have enough history,
-                        // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
                             const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
                             const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
-                                if (native_tools_enabled) turn_tool_specs else null,
+                                tools_for_request,
                                 turn_token_limit,
                                 turn_max_tokens,
                             );
                             response_attempt = 3;
                             self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                             self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
-                            break :retry_blk self.provider.chat(
-                                self.allocator,
-                                .{
-                                    .messages = recovery_msgs,
-                                    .session_id = self.memory_session_id,
-                                    .model = turn_model_name,
-                                    .temperature = self.temperature,
-                                    .max_tokens = recovery_max_tokens,
-                                    .tools = if (native_tools_enabled) turn_tool_specs else null,
-                                    .timeout_secs = self.message_timeout_secs,
-                                    .reasoning_effort = self.reasoning_effort,
-                                    .include_reasoning = include_reasoning,
-                                },
+                            break :retry_blk self.dispatchChat(
+                                recovery_msgs,
                                 turn_model_name,
-                                self.temperature,
+                                recovery_max_tokens,
+                                tools_for_request,
+                                include_reasoning,
+                                false,
                             ) catch |retry_after_compact_err| {
                                 if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                                 self.emitUsageFailure(turn_model_name);
@@ -2472,8 +2437,13 @@ pub const Agent = struct {
                         self.emitUsageFailure(turn_model_name);
                         return retry_err;
                     };
-                };
-            }
+                }
+
+                if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                self.emitUsageFailure(turn_model_name);
+                return err;
+            };
+
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
@@ -2579,7 +2549,7 @@ pub const Agent = struct {
                     if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, EMPTY_RESPONSE_RETRY) });
                         self.trimHistory();
                         empty_response_retry_count += 1;
                         continue;
@@ -2739,6 +2709,7 @@ pub const Agent = struct {
             }
 
             var loop_guard_notice: ?[]const u8 = null;
+            if (batchHasExternalContentTool(parsed_calls)) self.external_tools_locked = true;
             if (try self.executeToolCallBatch(
                 arena,
                 parsed_calls,
@@ -3501,6 +3472,14 @@ pub const Agent = struct {
     }
 
     fn checkToolPolicyGate(self: *Agent, call: ParsedToolCall) ?ToolExecutionResult {
+        if (self.external_tools_locked and isMutatingTool(call.name)) {
+            return .{
+                .name = call.name,
+                .output = "Blocked for the rest of this turn: outside content arrived, so write and command tools stay unavailable until the next message.",
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
         if (self.isInterruptRequested()) {
             return .{
                 .name = call.name,
@@ -10379,6 +10358,22 @@ test "Agent returns NoResponseContent after repeated empty final responses" {
 
     try std.testing.expectError(error.NoResponseContent, agent.turn("hello"));
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "empty response retry does not lecture about web_search" {
+    try std.testing.expect(std.mem.indexOf(u8, Agent.EMPTY_RESPONSE_RETRY, "Your previous reply was empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Agent.EMPTY_RESPONSE_RETRY, "web_search") == null);
+}
+
+test "outside content marks web tools and write or command tools" {
+    try std.testing.expect(Agent.isExternalContentTool("web_search"));
+    try std.testing.expect(Agent.isExternalContentTool("web_fetch"));
+    try std.testing.expect(!Agent.isExternalContentTool("shell"));
+    try std.testing.expect(Agent.isMutatingTool("shell"));
+    try std.testing.expect(Agent.isMutatingTool("file_write"));
+    try std.testing.expect(Agent.isMutatingTool("file_edit"));
+    try std.testing.expect(!Agent.isMutatingTool("file_read"));
+    try std.testing.expect(!Agent.isMutatingTool("memory_recall"));
 }
 
 test "Agent retries empty streaming response once" {

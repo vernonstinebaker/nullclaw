@@ -645,9 +645,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Enable streaming if provider supports it.
         // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
         // <think> content is printed live instead of being silently stripped.
+        // `agent -m` stdout is the published reply. Live tokens must not
+        // replace that text; the finished response is printed once below.
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
-            .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
+            .suppress_live = true,
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,

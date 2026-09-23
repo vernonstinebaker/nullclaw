@@ -420,7 +420,7 @@ pub const AgentConfig = struct {
     /// summarization while retaining hard trimming and emergency compression.
     /// Default is true to preserve the historical always-compact behavior.
     compact_context: bool = true,
-    max_tool_iterations: u32 = 1000,
+    max_tool_iterations: u32 = 32,
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
