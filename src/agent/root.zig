@@ -311,6 +311,9 @@ pub const Agent = struct {
     external_tools_locked: bool = false,
     max_history_messages: u32,
     auto_save: bool,
+    auto_recall: bool = true,
+    recall_limit: usize = 5,
+    max_context_bytes: usize = 4_000,
     compact_context: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
@@ -663,6 +666,9 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
+            .auto_recall = cfg.memory.auto_recall,
+            .recall_limit = @intCast(cfg.memory.recall_limit),
+            .max_context_bytes = @intCast(cfg.memory.max_context_bytes),
             .compact_context = cfg.agent.compact_context,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
@@ -2323,10 +2329,16 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched_raw = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, safe_user_message);
+        // auto_recall=false (upstream #979) skips injection entirely: storage via
+        // auto_save and the memory_recall tool still work; the response cache keeps
+        // its conservative memory-present disqualification (decision D7).
+        const enriched_raw = if (self.mem) |mem| blk: {
+            if (!self.auto_recall) break :blk try self.allocator.dupe(u8, safe_user_message);
+            break :blk try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id, .{
+                .recall_limit = self.recall_limit,
+                .max_context_bytes = self.max_context_bytes,
+            });
+        } else try self.allocator.dupe(u8, safe_user_message);
         const enriched = try self.redactOwnedForHistory(enriched_raw);
 
         // Keep the user message retained even if provider/tool steps fail.
@@ -10554,6 +10566,124 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
     try std.testing.expectEqualStrings("ok", response);
     try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
     try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
+}
+
+test "auto_recall false leaves the user message unenriched" {
+    const allocator = std.testing.allocator;
+
+    const CaptureProvider = struct {
+        chat_calls: usize = 0,
+        captured: [512]u8 = undefined,
+        captured_len: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            var i: usize = request.messages.len;
+            while (i > 0) {
+                i -= 1;
+                const msg = request.messages[i];
+                if (msg.role == .user) {
+                    const n = @min(msg.content.len, self.captured.len);
+                    @memcpy(self.captured[0..n], msg.content[0..n]);
+                    self.captured_len = n;
+                    break;
+                }
+            }
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn streamChat(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            return error.ShouldNotStream;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = CaptureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CaptureProvider.chatWithSystem,
+        .chat = CaptureProvider.chat,
+        .supportsNativeTools = CaptureProvider.supportsNativeTools,
+        .getName = CaptureProvider.getName,
+        .deinit = CaptureProvider.deinitFn,
+        .supports_streaming = CaptureProvider.supportsStreaming,
+        .stream_chat = CaptureProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+    try mem.store("user_lang", "Zig is the favorite language", .core, null);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = mem,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .auto_recall = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("language");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    // Upstream #979: auto_recall=false must skip memory injection entirely;
+    // the provider sees exactly the user's message.
+    try std.testing.expectEqualStrings(
+        "language",
+        provider_state.captured[0..provider_state.captured_len],
+    );
 }
 
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {

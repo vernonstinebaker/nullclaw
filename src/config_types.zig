@@ -1333,6 +1333,13 @@ pub const MemoryConfig = struct {
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
     instance_id: []const u8 = "",
     auto_save: bool = true,
+    /// When false, memory recall injection into inbound messages is skipped
+    /// entirely; storage via auto_save and the memory_recall tool still work.
+    auto_recall: bool = true,
+    /// Max memory entries injected per message (upstream #919 / #979).
+    recall_limit: u32 = 5,
+    /// Byte budget for the injected memory block. Counts UTF-8 bytes.
+    max_context_bytes: u32 = 4_000,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
     qmd: MemoryQmdConfig = .{},

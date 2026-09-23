@@ -1010,7 +1010,10 @@ Common issues:
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
-- `auto_save`: persists conversation memory automatically.
+- `auto_save`: persists conversation memory automatically (the **store** side).
+- `auto_recall` (default: `true`): when `false`, skips automatic memory injection into inbound messages entirely (the **inject** side). Storage via `auto_save` and on-demand recall via the `memory_recall` tool keep working. Note: the response cache stays ineligible for a turn whenever a memory backend is configured, even with `auto_recall` off.
+- `recall_limit` (default: `5`): maximum memory entries injected per message. This caps what is *injected*; `memory.search.query.max_results` separately caps what the retrieval engine *fetches*.
+- `max_context_bytes` (default: `4000`): byte budget for the injected memory block. A single entry is truncated to half the budget; counts UTF-8 bytes.
 - `response_cache.enabled` (default: `false`): exact response reuse for a direct reply. It stays off unless set. When enabled, a hit requires the same model, system prompt, user text, temperature, max tokens, and reasoning settings, and only applies to a turn with no tools, no memory retrieval, and no earlier conversation. Tool-using turns, follow-ups, and memory-backed turns always call the provider. A cache read or write failure does not fail the turn. `ttl_minutes` (default `60`) and `max_entries` (default `5000`) bound retention.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 

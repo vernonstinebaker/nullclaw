@@ -812,7 +812,10 @@ Max 说明：
 ### `memory`
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
-- `auto_save`: 开启后会自动持久化会话记忆。
+- `auto_save`: 开启后会自动持久化会话记忆（**存储**侧）。
+- `auto_recall`（默认：`true`）：设为 `false` 时完全跳过对入站消息的自动记忆注入（**注入**侧）。`auto_save` 的存储和 `memory_recall` 工具的按需召回不受影响。注意：只要配置了记忆后端，即使关闭 `auto_recall`，响应缓存对该回合仍然不可用。
+- `recall_limit`（默认：`5`）：每条消息最多注入的记忆条数。它限制的是*注入*数量；`memory.search.query.max_results` 单独限制检索引擎*获取*的候选数量。
+- `max_context_bytes`（默认：`4000`）：注入记忆块的字节预算。单条记忆会被截断到预算的一半；按 UTF-8 字节计数。
 - `response_cache.enabled`（默认：`false`）：仅对直接回复做精确复用，默认关闭。启用后，命中要求模型、系统提示、用户文本、temperature、max tokens 与推理设置都相同，且该回合没有工具、没有记忆检索、也没有更早的对话。使用工具的回合、后续消息和带记忆的回合总会再次调用提供方。缓存读写失败不会让回合失败。`ttl_minutes`（默认 `60`）和 `max_entries`（默认 `5000`）限制保留时间与条目数。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
