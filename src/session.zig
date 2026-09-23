@@ -4872,11 +4872,15 @@ test "restored session token reconstruction stays aligned across response cache 
     });
     defer testing.allocator.free(second);
     try testing.expectEqualStrings(first, second);
+    // Regression: the same follow-up text in an existing conversation, and any
+    // turn with retrieved memory, must call the provider again.
+    try testing.expectEqual(@as(usize, 2), mock.chat_calls);
 
-    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const one_reply = agent_mod.estimate_text_tokens("assistant reply");
+    const expected_tokens = one_reply * 2;
     const live_session = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(u64, expected_tokens), live_session.agent.total_tokens);
-    try testing.expectEqual(@as(u32, 0), live_session.agent.last_turn_usage.total_tokens);
+    try testing.expectEqual(@as(u32, @intCast(one_reply)), live_session.agent.last_turn_usage.total_tokens);
 
     live_session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));

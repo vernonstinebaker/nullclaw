@@ -5,12 +5,10 @@ const dispatcher = @import("dispatcher.zig");
 
 const ParsedToolCall = dispatcher.ParsedToolCall;
 
+// Memory backend vtables do not promise thread-safe reads; keep them sequential.
 const parallel_readonly_tools = [_][]const u8{
     "file_read",
     "file_read_hashed",
-    "memory_recall",
-    "memory_list",
-    "memory_search",
     "web_fetch",
     "web_search",
     "sqlite_query",
@@ -26,8 +24,29 @@ pub fn isParallelReadOnlyTool(name: []const u8) bool {
 
 pub fn batchAllParallelReadOnly(calls: []const ParsedToolCall) bool {
     if (calls.len <= 1) return false;
-    for (calls) |call| {
+    for (calls, 0..) |call, i| {
+        // Resolve duplicate native IDs sequentially so the first result is in
+        // the replay cache before another call with that ID can execute.
+        if (call.tool_call_id) |id| {
+            if (id.len > 0) for (calls[0..i]) |earlier| {
+                if (earlier.tool_call_id) |previous| {
+                    if (std.mem.eql(u8, id, previous)) return false;
+                }
+            };
+        }
         if (!isParallelReadOnlyTool(call.name)) return false;
+        if (std.mem.eql(u8, std.mem.trim(u8, call.name, " \t\r\n"), "file_read")) {
+            // Bootstrap file reads may call a shared memory backend. Parse with
+            // bounded scratch space; malformed/large arguments stay sequential.
+            var scratch: [4096]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+            const parsed = std.json.parseFromSlice(std.json.Value, fixed.allocator(), call.arguments_json, .{}) catch return false;
+            defer parsed.deinit();
+            if (parsed.value != .object) return false;
+            const path = parsed.value.object.get("path") orelse return false;
+            if (path != .string) return false;
+            if (@import("../tools/file_common.zig").bootstrapRootFilename(path.string) != null) return false;
+        }
     }
     return true;
 }
@@ -59,4 +78,20 @@ test "shouldRunParallelReadOnlyBatch requires parallel_tools flag" {
     };
     try std.testing.expect(!shouldRunParallelReadOnlyBatch(false, &calls));
     try std.testing.expect(shouldRunParallelReadOnlyBatch(true, &calls));
+}
+
+test "memory tools remain sequential without a backend concurrency contract" {
+    // Regression: read-only memory calls may mutate backend caches/allocators.
+    for ([_][]const u8{ "memory_recall", "memory_list", "memory_search" }) |name| {
+        try std.testing.expect(!isParallelReadOnlyTool(name));
+    }
+}
+
+test "bootstrap file reads remain sequential" {
+    // Regression: file_read can delegate bootstrap files to shared memory.
+    const calls = [_]ParsedToolCall{
+        .{ .name = "file_read", .arguments_json = "{\"path\":\"AGENTS.md\"}" },
+        .{ .name = "file_read", .arguments_json = "{\"path\":\"notes.txt\"}" },
+    };
+    try std.testing.expect(!batchAllParallelReadOnly(&calls));
 }

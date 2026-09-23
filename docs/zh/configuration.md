@@ -813,6 +813,7 @@ Max 说明：
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
 - `auto_save`: 开启后会自动持久化会话记忆。
+- `response_cache.enabled`（默认：`false`）：仅对直接回复做精确复用，默认关闭。启用后，命中要求模型、系统提示、用户文本、temperature、max tokens 与推理设置都相同，且该回合没有工具、没有记忆检索、也没有更早的对话。使用工具的回合、后续消息和带记忆的回合总会再次调用提供方。缓存读写失败不会让回合失败。`ttl_minutes`（默认 `60`）和 `max_entries`（默认 `5000`）限制保留时间与条目数。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
 **注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
@@ -906,8 +907,9 @@ Max 说明：
 
 面向长工具链循环（尤其是本地模型）的上下文与循环卫生设置。
 
-- `parallel_tools`（默认：`false`）：为 `true` 且同一 assistant 批次中的工具调用全部为只读白名单工具（如 `file_read`、`memory_recall`、`web_fetch` 等）时，NullClaw 可并发执行这些调用，并发上限为 `agent.local_loop.max_parallel_readonly`。混合批次或可写工具仍按顺序执行。
+- `parallel_tools`（默认：`false`）：为 `true` 且同一 assistant 批次中的工具调用全部为只读白名单工具（`file_read`、`file_read_hashed`、`web_fetch`、`web_search`、`sqlite_query`）时，NullClaw 可并发执行这些调用，并发上限为 `agent.local_loop.max_parallel_readonly`。混合批次、内存后端工具、可能访问内存后端的引导文件读取及可写工具仍按顺序执行。所有已启动线程完成并被回收后才释放其输出存储，即使线程启动或结果复制失败也是如此。
 - `local_loop`：可选的压缩、循环检测与并行只读批次限制。
+- `tools.groups`：`always` 组在整个回合保持可用，包括较短的 MCP 名称、超过 16 个工具，以及 `continue` 这类后续消息。`dynamic` 组仅在当前用户文本或回合中注入的指令包含其关键词时加入。未配置分组时，MCP schema 仍按文本中出现的名称收窄。`web_search`、`web_fetch`、`http_request` 或 `browser` 一旦执行，已命名的写入和命令工具会在该回合剩余时间内保持禁用，即使外部调用失败也是如此。下一条消息会解除锁定。该锁定不覆盖任意 MCP 写入工具，也不是完整的提示注入防护。
 
 ```json
 {
@@ -928,7 +930,8 @@ Max 说明：
 
 说明：
 
-- `local_loop.enabled = true` 时，工具结果写入历史的默认字符上限收紧为 400（除非显式设置了 `max_result_chars`）。
+- 工具输出默认保持原样，再执行凭据/PII 脱敏。`local_loop.enabled = true` 仅对 `shell` 日志启用有损压缩，默认上限为 400 字节（除非显式设置 `max_result_chars`）。文件、结构化数据、搜索和 MCP 输出保留内容；历史配置名 `max_result_chars` 实际按 UTF-8 字节计数。
+- 启用压缩后保留日志尾部及可用的错误摘要，并标记省略/截断。极小的上限只能容纳标记前缀。需要完整证据时，将日志写入文件并按偏移读取，或调整命令获取遗漏内容。
 - 同一 turn 内相同 `name + arguments_json` 的工具调用会指纹识别；warn/veto/force-reply 阈值按 turn 计算。
 - 省略 `local_loop` 时默认行为与现有配置兼容。
 

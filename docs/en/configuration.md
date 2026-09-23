@@ -1011,6 +1011,7 @@ Common issues:
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
 - `auto_save`: persists conversation memory automatically.
+- `response_cache.enabled` (default: `false`): exact response reuse for a direct reply. It stays off unless set. When enabled, a hit requires the same model, system prompt, user text, temperature, max tokens, and reasoning settings, and only applies to a turn with no tools, no memory retrieval, and no earlier conversation. Tool-using turns, follow-ups, and memory-backed turns always call the provider. A cache read or write failure does not fail the turn. `ttl_minutes` (default `60`) and `max_entries` (default `5000`) bound retention.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
 **Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
@@ -1107,8 +1108,9 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 
 Loop and context hygiene settings for long tool-heavy runs (especially local models).
 
-- `parallel_tools` (default: `false`): when `true`, and every tool call in one assistant batch is a read-only allowlisted tool (`file_read`, `memory_recall`, `web_fetch`, etc.), NullClaw may execute those calls concurrently up to `agent.local_loop.max_parallel_readonly`. Mixed batches or write-capable tools still run sequentially.
+- `parallel_tools` (default: `false`): when `true`, and every tool call in one assistant batch is a read-only allowlisted tool (`file_read`, `file_read_hashed`, `web_fetch`, `web_search`, `sqlite_query`), NullClaw may execute those calls concurrently up to `agent.local_loop.max_parallel_readonly`. Mixed batches, memory-backend tools, bootstrap-file reads (which may use a memory backend), and write-capable tools still run sequentially. Worker output storage is retained until all started workers join, including on spawn/copy failure.
 - `local_loop`: optional limits for compression, loop detection, and parallel read batches.
+- `tools.groups`: an `always` group stays available for the whole turn, including short MCP names, lists longer than 16, and follow-ups such as `continue`. A `dynamic` group is included only when the current user text or a mid-turn injection contains one of its keywords. With no groups configured, MCP schemas are still narrowed to names mentioned in that text. After `web_search`, `web_fetch`, `http_request`, or `browser` runs, named write and command tools stay blocked for the rest of that turn even if the external call failed. The lock clears on the next message. It does not cover arbitrary MCP write tools and is not a complete prompt-injection defense.
 
 ```json
 {
@@ -1129,7 +1131,8 @@ Loop and context hygiene settings for long tool-heavy runs (especially local mod
 
 Notes:
 
-- `local_loop.enabled = true` tightens the default tool-result history cap to 400 characters (unless `max_result_chars` is set explicitly).
+- Tool output is lossless by default before credential/PII scrubbing. `local_loop.enabled = true` enables lossy compression only for `shell` logs, with a default 400-byte cap (unless `max_result_chars` is set explicitly). File, structured-data, search, and MCP outputs retain their contents. The historical `max_result_chars` name counts UTF-8 bytes.
+- Opt-in shell logs retain the configured tail and an error signature when available; omission/truncation is marked. Very small byte caps can retain only a prefix of the marker. Redirect needed full logs to a file and read them with offsets, or refine the command to retrieve omitted evidence.
 - Identical tool calls within one turn fingerprint `name + arguments_json`. Warn/veto/force-reply thresholds apply per turn.
 - Defaults preserve existing behavior when `local_loop` is omitted.
 

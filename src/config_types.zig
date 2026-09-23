@@ -375,8 +375,9 @@ pub const ToolFilterGroup = struct {
 };
 
 pub const LocalLoopConfig = struct {
-    /// When true, apply tighter history compression defaults (Phase 1 adds constrained decode).
+    /// Opt in to bounded, lossy shell-log compression; source/data remain lossless.
     enabled: bool = false,
+    /// Historical name; this limit counts UTF-8 bytes, not characters.
     max_result_chars: u32 = 8192,
     max_result_tail_lines: u32 = 12,
     identical_call_warn: u32 = 3,

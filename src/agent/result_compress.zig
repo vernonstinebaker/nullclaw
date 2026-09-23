@@ -11,6 +11,7 @@ pub const CompressOptions = struct {
     max_chars: u32 = DEFAULT_MAX_RESULT_CHARS,
     max_tail_lines: u32 = DEFAULT_MAX_RESULT_TAIL_LINES,
     is_error: bool = false,
+    tail_logs: bool = false,
 };
 
 const ERROR_MARKERS = [_][]const u8{
@@ -23,6 +24,7 @@ const ERROR_MARKERS = [_][]const u8{
 
 /// Shrink tool output for history injection. Returns an owned slice.
 pub fn compressToolOutput(allocator: std.mem.Allocator, raw: []const u8, opts: CompressOptions) ![]const u8 {
+    if (!opts.tail_logs) return clipOutput(allocator, raw, opts.max_chars);
     const normalized = std.mem.trim(u8, raw, " \t\r\n");
     if (normalized.len == 0) return try allocator.dupe(u8, "");
 
@@ -44,18 +46,15 @@ pub fn compressToolOutput(allocator: std.mem.Allocator, raw: []const u8, opts: C
     const joined = try std.mem.join(allocator, "\n", parts.items);
     defer allocator.free(joined);
 
-    if (joined.len <= opts.max_chars) {
-        return try allocator.dupe(u8, joined);
-    }
+    return clipOutput(allocator, joined, opts.max_chars);
+}
 
-    const clipped = util.truncateUtf8(joined, opts.max_chars);
+fn clipOutput(allocator: std.mem.Allocator, raw: []const u8, cap: usize) ![]const u8 {
+    if (raw.len <= cap) return allocator.dupe(u8, raw);
     const suffix = "\n… [truncated]";
-    if (clipped.len + suffix.len <= opts.max_chars) {
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ clipped, suffix });
-    }
-    const body_len = opts.max_chars -| suffix.len;
-    const body = util.truncateUtf8(clipped, body_len);
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ body, suffix });
+    if (cap < suffix.len) return allocator.dupe(u8, util.truncateUtf8(suffix, cap));
+    const body = util.truncateUtf8(raw, cap - suffix.len);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ body, suffix });
 }
 
 fn extractTail(allocator: std.mem.Allocator, text: []const u8, max_lines: u32) ![]const u8 {
@@ -85,24 +84,13 @@ fn extractErrorSignature(text: []const u8) ?[]const u8 {
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        const lower_buf = stackLowerAscii(trimmed);
         for (ERROR_MARKERS) |marker| {
-            if (std.mem.indexOf(u8, lower_buf, marker) != null) {
-                const cap = @min(trimmed.len, 180);
-                return trimmed[0..cap];
+            if (std.ascii.indexOfIgnoreCase(trimmed, marker) != null) {
+                return util.truncateUtf8(trimmed, 180);
             }
         }
     }
     return null;
-}
-
-fn stackLowerAscii(input: []const u8) []const u8 {
-    const cap = @min(input.len, 256);
-    var buf: [256]u8 = undefined;
-    for (input[0..cap], 0..) |c, i| {
-        buf[i] = std.ascii.toLower(c);
-    }
-    return buf[0..cap];
 }
 
 test "compressToolOutput empty input returns empty string" {
@@ -141,6 +129,7 @@ test "compressToolOutput keeps last tail lines and omits earlier lines" {
         \\line 19
     ;
     const out = try compressToolOutput(std.testing.allocator, raw, .{
+        .tail_logs = true,
         .max_tail_lines = 3,
         .max_chars = 8192,
     });
@@ -159,6 +148,7 @@ test "compressToolOutput prepends error signature for failed tools" {
     ;
     const out = try compressToolOutput(std.testing.allocator, raw, .{
         .is_error = true,
+        .tail_logs = true,
         .max_tail_lines = 2,
         .max_chars = 8192,
     });
@@ -176,4 +166,32 @@ test "compressToolOutput hard caps at max_chars with truncated marker" {
     try std.testing.expect(out.len <= 400);
     try std.testing.expect(std.mem.indexOf(u8, out, "… [truncated]") != null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "compression preserves source whitespace and leading lines below cap" {
+    // Regression: unconditional trim/tail discarded source structure and evidence.
+    for ([_][]const u8{
+        "def run():\n    if True:\n        return 1\n\n",
+        "root:\n  child: value\n\n",
+        "{\n  \"value\": [1, 2]\n}\n",
+        "first\n" ++ "  line\n" ** 20,
+    }) |raw| {
+        const out = try compressToolOutput(std.testing.allocator, raw, .{});
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(raw, out);
+    }
+}
+
+test "compression respects every tiny byte cap and UTF8 signature boundary" {
+    // Regression: the truncation marker exceeded small caps; signatures split UTF8.
+    const raw = "ErRoR: " ++ "x" ** 172 ++ "界" ++ "tail\n" ++ "z" ** 500;
+    for (0..32) |cap| {
+        const out = try compressToolOutput(std.testing.allocator, raw, .{ .max_chars = @intCast(cap), .is_error = true });
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(out.len <= cap);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    }
+    const signature = @call(.never_inline, extractErrorSignature, .{raw}).?;
+    try std.testing.expect(std.mem.startsWith(u8, signature, "ErRoR:"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(signature));
 }
