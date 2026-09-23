@@ -1957,12 +1957,14 @@ pub const Agent = struct {
     }
 
     const EMPTY_RESPONSE_RETRY = "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or the necessary tool call. Do not return an empty response.";
+    const ACTION_FOLLOW_THROUGH = "SYSTEM: You promised to act and did not call a tool. Call the tool now, or state the limitation. Do not promise again.";
+    const MAX_MATCHED_MCP_TOOLS: usize = 16;
 
     fn isExternalContentTool(name: []const u8) bool {
         const trimmed = std.mem.trim(u8, name, " \t\r\n");
         return std.ascii.eqlIgnoreCase(trimmed, "web_search") or
             std.ascii.eqlIgnoreCase(trimmed, "web_fetch") or
-            std.ascii.eqlIgnoreCase(trimmed, "http") or
+            std.ascii.eqlIgnoreCase(trimmed, "http_request") or
             std.ascii.eqlIgnoreCase(trimmed, "browser") or
             std.ascii.eqlIgnoreCase(trimmed, "browser_open");
     }
@@ -1974,7 +1976,14 @@ pub const Agent = struct {
             std.ascii.eqlIgnoreCase(trimmed, "file_edit") or
             std.ascii.eqlIgnoreCase(trimmed, "file_edit_hashed") or
             std.ascii.eqlIgnoreCase(trimmed, "file_append") or
-            std.ascii.eqlIgnoreCase(trimmed, "git_operations");
+            std.ascii.eqlIgnoreCase(trimmed, "file_delete") or
+            std.ascii.eqlIgnoreCase(trimmed, "git_operations") or
+            std.ascii.eqlIgnoreCase(trimmed, "cron_add") or
+            std.ascii.eqlIgnoreCase(trimmed, "cron_update") or
+            std.ascii.eqlIgnoreCase(trimmed, "cron_remove") or
+            std.ascii.eqlIgnoreCase(trimmed, "cron_run") or
+            std.ascii.eqlIgnoreCase(trimmed, "memory_store") or
+            std.ascii.eqlIgnoreCase(trimmed, "memory_forget");
     }
 
     fn batchHasExternalContentTool(calls: []const ParsedToolCall) bool {
@@ -1989,6 +1998,43 @@ pub const Agent = struct {
         for (specs) |spec| {
             if (isMutatingTool(spec.name)) continue;
             try kept.append(arena, spec);
+        }
+        return kept.toOwnedSlice(arena);
+    }
+
+    fn mcpTokenIsSpecific(part: []const u8) bool {
+        if (part.len < 5) return false;
+        const generic = [_][]const u8{
+            "list",   "create", "update", "delete", "remove",
+            "search", "query",  "write",  "tools",  "items",
+        };
+        for (generic) |word| {
+            if (std.ascii.eqlIgnoreCase(part, word)) return false;
+        }
+        return true;
+    }
+
+    fn mcpToolRelevantToMessage(name: []const u8, message: []const u8) bool {
+        var it = std.mem.splitScalar(u8, name, '_');
+        while (it.next()) |part| {
+            if (!mcpTokenIsSpecific(part)) continue;
+            if (std.ascii.indexOfIgnoreCase(message, part) != null) return true;
+        }
+        return false;
+    }
+
+    fn narrowMcpToolsForTurn(arena: std.mem.Allocator, specs: []const ToolSpec, user_message: []const u8) ![]const ToolSpec {
+        var kept: std.ArrayListUnmanaged(ToolSpec) = .empty;
+        var matched_mcp: usize = 0;
+        for (specs) |spec| {
+            if (!std.mem.startsWith(u8, spec.name, "mcp_")) {
+                try kept.append(arena, spec);
+                continue;
+            }
+            if (matched_mcp >= MAX_MATCHED_MCP_TOOLS) continue;
+            if (!mcpToolRelevantToMessage(spec.name, user_message)) continue;
+            try kept.append(arena, spec);
+            matched_mcp += 1;
         }
         return kept.toOwnedSlice(arena);
     }
@@ -2301,6 +2347,7 @@ pub const Agent = struct {
             if (self.external_tools_locked) {
                 turn_tool_specs = try dropMutatingToolSpecs(arena, turn_tool_specs);
             }
+            turn_tool_specs = try narrowMcpToolsForTurn(arena, turn_tool_specs, effective_user_message);
             const priority_tool = self.priorityToolForSpecsMessage(turn_tool_specs, effective_user_message);
 
             // Build messages slice for provider (arena-owned; freed at end of iteration).
@@ -2359,37 +2406,37 @@ pub const Agent = struct {
                     };
                 }
 
-                if (!is_streaming) {
-                    const err_name = @errorName(err);
-                    if (providers.reliable.isContextExhausted(err_name) and
-                        self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        self.forceCompressHistory())
-                    {
-                        self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
-                        const recovery_max_tokens = self.effectiveMaxTokensForTurn(
-                            recovery_msgs,
-                            tools_for_request,
-                            turn_token_limit,
-                            turn_max_tokens,
-                        );
-                        response_attempt = 2;
-                        self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
-                        self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
-                        break :retry_blk self.dispatchChat(
-                            recovery_msgs,
-                            turn_model_name,
-                            recovery_max_tokens,
-                            tools_for_request,
-                            include_reasoning,
-                            false,
-                        ) catch |retry_after_compact_err| {
-                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
-                            self.emitUsageFailure(turn_model_name);
-                            return retry_after_compact_err;
-                        };
-                    }
+                const err_name = @errorName(err);
+                if (providers.reliable.isContextExhausted(err_name) and
+                    self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                    self.forceCompressHistory())
+                {
+                    self.context_was_compacted = true;
+                    const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
+                    const recovery_max_tokens = self.effectiveMaxTokensForTurn(
+                        recovery_msgs,
+                        tools_for_request,
+                        turn_token_limit,
+                        turn_max_tokens,
+                    );
+                    response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, is_streaming);
+                    break :retry_blk self.dispatchChat(
+                        recovery_msgs,
+                        turn_model_name,
+                        recovery_max_tokens,
+                        tools_for_request,
+                        include_reasoning,
+                        is_streaming,
+                    ) catch |retry_after_compact_err| {
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                        self.emitUsageFailure(turn_model_name);
+                        return retry_after_compact_err;
+                    };
+                }
 
+                if (!is_streaming) {
                     if (self.routeShouldBeDegraded(err)) {
                         if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
                         self.emitUsageFailure(turn_model_name);
@@ -2567,9 +2614,7 @@ pub const Agent = struct {
                     shouldForceActionFollowThrough(display_text))
                 {
                     try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(display_text) });
-                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
-                        "Do it in this turn by issuing the appropriate tool call(s). " ++
-                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, ACTION_FOLLOW_THROUGH) });
                     self.trimHistory();
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -10372,8 +10417,31 @@ test "outside content marks web tools and write or command tools" {
     try std.testing.expect(Agent.isMutatingTool("shell"));
     try std.testing.expect(Agent.isMutatingTool("file_write"));
     try std.testing.expect(Agent.isMutatingTool("file_edit"));
+    try std.testing.expect(Agent.isMutatingTool("file_delete"));
+    try std.testing.expect(Agent.isMutatingTool("cron_add"));
+    try std.testing.expect(Agent.isMutatingTool("memory_store"));
+    try std.testing.expect(Agent.isExternalContentTool("http_request"));
     try std.testing.expect(!Agent.isMutatingTool("file_read"));
     try std.testing.expect(!Agent.isMutatingTool("memory_recall"));
+    try std.testing.expect(!Agent.isMutatingTool("cron_list"));
+}
+
+test "ordinary turns omit unrelated mcp tool schemas" {
+    const specs = [_]ToolSpec{
+        .{ .name = "file_read", .description = "read", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "tasks", .parameters_json = "{}" },
+        .{ .name = "mcp_weather_forecast", .description = "weather", .parameters_json = "{}" },
+    };
+    const quiet = try Agent.narrowMcpToolsForTurn(std.testing.allocator, &specs, "Reply with pong");
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expectEqual(@as(usize, 1), quiet.len);
+    try std.testing.expectEqualStrings("file_read", quiet[0].name);
+
+    const matched = try Agent.narrowMcpToolsForTurn(std.testing.allocator, &specs, "show vikunja tasks");
+    defer std.testing.allocator.free(matched);
+    try std.testing.expectEqual(@as(usize, 2), matched.len);
+    try std.testing.expectEqualStrings("file_read", matched[0].name);
+    try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", matched[1].name);
 }
 
 test "Agent retries empty streaming response once" {
@@ -10548,7 +10616,7 @@ test "Agent forces follow-through retry for streaming deferred promise" {
             if (self.call_count == 2) {
                 for (request.messages) |msg| {
                     if (msg.role == .user and
-                        std.mem.indexOf(u8, msg.content, "You just promised to take action now") != null)
+                        std.mem.indexOf(u8, msg.content, "did not call a tool") != null)
                     {
                         self.saw_follow_through_prompt = true;
                         break;
