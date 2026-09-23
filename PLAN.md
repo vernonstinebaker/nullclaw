@@ -213,16 +213,47 @@ Resource measurements, macOS arm64, Zig 0.16.0, HEAD `10231364`, uncommitted har
 
 The default artifact grew by 18,976 bytes from the planning baseline. Both profiles are above the <1 MB binary target; the planning baseline was already 4.89 MB, so this change does not move that target. `version` MaxRSS is under the <5 MB runtime target and is startup only, not a model turn. Suite MaxRSS was not remeasured: `zig build test` does not print it, and launching the cached test executable directly aborts because it expects the Zig test server. The historical 344 MB figure remains a test-process measurement, not production RSS. No representative provider turn was measured.
 
+## Upstream intake — nullclaw/nullclaw → vernonstinebaker/nullclaw (authorized 2026-09-23)
+
+Upstream `nullclaw/nullclaw` is dormant (no maintainer merges since 2026-04-17; 28 PRs open). We now maintain our fork's `main` directly. This scope incorporates selected **third-party** upstream PRs, one PR per increment, ranked against our environments: the OrangePi `webdav` MCP stdio server (`mcp_webdav_*` in an `always` tool-filter group), the bilingual `docs/en` + `docs/zh` tree, and the three-host fleet (macOS arm64, OrangePi riscv64, Radxa aarch64 — daemon 24/7, Mattermost + Discord, sqlite memory, cron heartbeats).
+
+**Workflow contract, per intake (mandatory):**
+
+1. `git fetch origin && git log -1 --oneline origin/main` — a second agent session works in this repo and pushes may arrive concurrently (the hardening phases landed as `90e4b01c` during another session's review). Never overwrite concurrent work; rebase intake work on the new HEAD if it moved.
+2. Fetch the exact upstream diff: `gh pr diff <N> -R nullclaw/nullclaw`. Prefer applying it verbatim (keeps future upstream merges clean); reconcile manually where our tree diverged, and say so in the commit body.
+3. **Test first** where behavior is testable: apply/add the regression test, run it, observe and record the intended RED before the fix.
+4. `zig fmt --check` on changed Zig files, then `zig build test --summary all` — zero failures, zero leaks. Docs-only intakes still run the suite (cheap, and the pre-push hook runs it anyway).
+5. Commit only the intake's files. **Never stage** `.claw/`, `CHECKIN.md`, `palace/` (live credentials), `docs/en/rest-admin-api.md` (unrelated WIP), or `zig-out-*`.
+6. `git push origin main`. Rollback unit = `git revert <intake commit>`; keep one PR per commit where the diff allows.
+
+**Intake ledger** (status: `TODO`, `RED`, `GREEN (validation pending)`, `DONE`, `DEFERRED`):
+
+| ID | Upstream PR | Scope / environment rationale | Status | Commit / evidence |
+|---|---|---|---|---|
+| U-1 | #985 (raskevichai) | `SESSION_TURN_STACK_SIZE` 2 MiB alias → 16 MiB. Turn path overflowed into the guard page and killed the process per inbound message on aarch64 — our Radxa. Turn path got deeper in `90e4b01c`; `thread_stacks.zig` untouched by it, applies cleanly. | TODO | — |
+| U-2 | #776 (telagod) | New en+zh docs: `mcp.md`, subagents, skills, voice, hardware (+651, 13 files, docs-only). Documents the exact MCP surface our `webdav`/`vikunja`/`mattermost` MCP servers use. **When landing: amend `mcp.md` to document the post-P7 rule — `narrowMcpToolsForTurn` only runs when no `tool_filter_groups` are configured.** | TODO | — |
+| U-3 | #979 (valonmulolli) | `memory.auto_recall` / `recall_limit` / `max_context_bytes` config knobs (closes upstream #919). Composes with P8 replay/memory bounds. **Conflicts expected:** `90e4b01c` reworked `memory_loader.zig`, sqlite engine, `memory_recall.zig`, and `agent/root.zig` — the upstream patch will not apply cleanly; reconcile semantics manually (budget injected recall bytes), not line-by-line. | TODO | — |
+| U-4 | #777 (telagod) | Docs cleanup: archive `docs/integration-analysis.md` + `docs/integration-roadmap.md` to `docs/archive/`, slim `CONTRIBUTING.md`, cross-ref `SECURITY.md`. Both stale files still present in our tree. | TODO | — |
+| U-5 | #984 (raskevichai) | Supervisor: age out dead polling threads even when their failure path keeps refreshing the heartbeat. Symptoms reported on Telegram/Matrix; **before landing, verify the fix covers our Mattermost/Discord transports** — if not, record that and land only the general supervisor repair. | TODO | — |
+| U-6 | — | Update `docs/plans/core-review-2026-09-23.md` to mark findings R1–R9 addressed at `90e4b01c` (plan ledger phases 1–8); the review currently reads as all-open. Docs-only. | TODO | — |
+
+**Deferred / rejected (do not intake without a new user decision):**
+
+- **#969** (approval flow, +11k lines): target region rewritten in `90e4b01c`; merging is now a re-implementation. Keep as a *design reference* only.
+- **#980**: redundant — our merged #959 already persists the paired token encrypted (verified in `src/gateway.zig` / `src/cron.zig`).
+- Tier 3 (opportunistic, no urgency): #990 Eden AI provider, #956 alpine bump, #958 Teams JWT fix, #968 Matrix persistence, #981 grok-cli, #775 CLAUDE.md dedup, #774 doc stats.
+- Tier 4 (do not take): #319 DingTalk recall, #667 email/IMAP channel, #411 tool customization (our `tool_filter_groups` cover the need), #982/#983 proxy transports, #989 README chart, #527 megapr (+617k lines).
+
 ## Current handoff
 
-- **HEAD:** `10231364`. Hardening is uncommitted. No commit or push was requested.
-- **Active task:** none. Phases 0–8 are done.
-- **Changed files:** `src/agent/root.zig`, `src/agent/dispatcher.zig`, `src/agent/loop_guard.zig`, `src/agent/parallel_tools.zig`, `src/agent/result_compress.zig`, `src/config_types.zig`, `src/session.zig`, `docs/en/configuration.md`, `docs/zh/configuration.md`, `PLAN.md`.
-- **Validation:** `zig fmt --check` on the changed Zig files, then `zig build test --summary all`: 7,530 passed, 9 skipped, exit 0. ReleaseSmall exit 0. Measurements are in the P8 validation note.
+- **HEAD:** `90e4b01c` (= `origin/main`). Hardening phases 0–8 were committed and pushed as `90e4b01c` by the concurrent session after the previous handoff was written; working tree clean apart from the preserved untracked files.
+- **Active task:** upstream intake scope above, in ledger order. Start at the first non-`DONE` row.
+- **Standing next action:** U-1 (#985), test first.
+- **Changed files:** none uncommitted. Hardening diff from the previous handoff landed as commit `90e4b01c` (same file list: `src/agent/root.zig`, `src/agent/dispatcher.zig`, `src/agent/loop_guard.zig`, `src/agent/parallel_tools.zig`, `src/agent/result_compress.zig`, `src/config_types.zig`, `src/session.zig`, `docs/en/configuration.md`, `docs/zh/configuration.md`, `PLAN.md`).
+- **Validation at `90e4b01c`:** final recorded suite 7,533 passed / 9 skipped (session log below); ReleaseSmall recorded in the P8 note. Re-run the suite before relying on it — concurrent sessions may have advanced HEAD.
 - **Pending processes:** none.
-- **Next action:** review the uncommitted diff and commit only if asked. Do not stage `.claw/`, `CHECKIN.md`, `palace/`, `docs/en/rest-admin-api.md`, or `zig-out-*`.
 - **Known constraints:** the external-content lock still does not cover arbitrary MCP writes. Replay payloads can be truncated or emptied once the turn budget is full; the identity is kept so the action is not run again. Default ReleaseSmall remains about 4.9 MB. This is not an exhaustive provider or security audit.
-- **Stop rule:** phases are complete. Do not start a new scope from this plan without a new request.
+- **Stop rule:** hardening phases are complete. The upstream intake scope above is active under an explicit user request dated 2026-09-23; stop when its ledger rows are DONE/DEFERRED and the handoff reflects the last pushed commit.
 
 ## Session log
 
@@ -234,3 +265,4 @@ The default artifact grew by 18,976 bytes from the planning baseline. Both profi
 | 2026-09-23 | Completed P3; default source/data fidelity, bounded UTF-8 shell compression, expired stack reference removed; 7,509 passed / 9 skipped, ReleaseSmall passes | P4.R |
 | 2026-09-23 | Completed P4–P8 on the uncommitted tree. Final suite 7,530 passed / 9 skipped. ReleaseSmall default 4,904,856 bytes. External-content lock retained (D6) | review / commit if asked |
 | 2026-09-23 | Added full-turn interrupt-between-tools, interrupt-before-summary, and raised-cap replay tests. Suite 7,533 passed / 9 skipped | commit |
+| 2026-09-23 | Hardening committed+pushed as `90e4b01c` (concurrent session). Assessed all 19 open third-party upstream PRs against our environments; user authorized intake. Added upstream intake scope (U-1…U-6 + deferred list) to this plan | U-1 RED |
