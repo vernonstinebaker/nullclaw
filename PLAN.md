@@ -252,7 +252,7 @@ Upstream `nullclaw/nullclaw` is dormant (no maintainer merges since 2026-04-17; 
 
 - **HEAD:** `90e4b01c` (= `origin/main`). Hardening phases 0–8 were committed and pushed as `90e4b01c` by the concurrent session after the previous handoff was written; working tree clean apart from the preserved untracked files.
 - **Active task:** upstream intake scope above, in ledger order. Start at the first non-`DONE` row.
-- **Standing next action:** U-1 (#985), test first.
+- **Standing next action:** none — every ledger row is DONE or DEFERRED (not approved). New work requires a new user decision.
 - **Changed files:** none uncommitted. Hardening diff from the previous handoff landed as commit `90e4b01c` (same file list: `src/agent/root.zig`, `src/agent/dispatcher.zig`, `src/agent/loop_guard.zig`, `src/agent/parallel_tools.zig`, `src/agent/result_compress.zig`, `src/config_types.zig`, `src/session.zig`, `docs/en/configuration.md`, `docs/zh/configuration.md`, `PLAN.md`).
 - **Validation at `90e4b01c`:** final recorded suite 7,533 passed / 9 skipped (session log below); ReleaseSmall recorded in the P8 note. Re-run the suite before relying on it — concurrent sessions may have advanced HEAD.
 - **Pending processes:** none.
