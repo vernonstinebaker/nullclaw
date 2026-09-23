@@ -103,24 +103,21 @@ pub fn loadContext(
     var appended: usize = 0;
     var wrote_header = false;
 
-    // Prefer scoped high-signal entries first. Archived conversation chunks are
-    // still allowed, but only after non-archived matches from the same scope.
-    for ([_]bool{ false, true }) |include_archived| {
-        for (scoped_entries) |entry| {
-            if (isInternalMemoryEntry(entry)) continue;
-            if (isArchiveConversationEntry(entry) != include_archived) continue;
-            if (!wrote_header) {
-                try w.writeAll("[Memory context]\n");
-                wrote_header = true;
-            }
-            // Truncate individual entry content to prevent a single large memory from blowing the budget
-            const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
-            const sanitized = try sanitizeMemoryText(allocator, content);
-            defer allocator.free(sanitized);
-            try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
-            appended += 1;
-            if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+    // Archived conversation shards are hygiene copies of old turns. Injecting
+    // them makes a later model treat the live user message as history.
+    for (scoped_entries) |entry| {
+        if (isInternalMemoryEntry(entry)) continue;
+        if (isArchiveConversationEntry(entry)) continue;
+        if (!wrote_header) {
+            try w.writeAll("[Memory context]\n");
+            wrote_header = true;
         }
+        // Truncate individual entry content to prevent a single large memory from blowing the budget
+        const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+        const sanitized = try sanitizeMemoryText(allocator, content);
+        defer allocator.free(sanitized);
+        try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
+        appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
 
@@ -186,44 +183,43 @@ pub fn loadContextWithRuntime(
     var appended: usize = 0;
     var wrote_header = false;
 
-    for ([_]bool{ false, true }) |include_archived| {
-        for (scoped_candidates) |cand| {
-            if (isInternalMemoryKey(cand.key)) continue;
-            if (extractMarkdownMemoryKey(cand.snippet)) |extracted| {
-                if (isInternalMemoryKey(extracted)) continue;
-            }
-            if (isArchiveConversationCandidate(cand) != include_archived) continue;
-            if (!wrote_header) {
-                try w.writeAll("[Memory context]\n");
-                wrote_header = true;
-            }
-            const snippet = util.truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
-            const sanitized = try sanitizeMemoryText(allocator, snippet);
-            defer allocator.free(sanitized);
-            try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
-            appended += 1;
-            if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+    // Archived conversation shards stay out of the live turn. They are copies
+    // of old autosave rows, and models treat them as the user's request.
+    for (scoped_candidates) |cand| {
+        if (isInternalMemoryKey(cand.key)) continue;
+        if (extractMarkdownMemoryKey(cand.snippet)) |extracted| {
+            if (isInternalMemoryKey(extracted)) continue;
         }
-        if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES) {
-            if (scoped_fallback_entries) |entries| {
-                for (entries) |entry| {
-                    if (containsCandidateKey(scoped_candidates, entry.key)) continue;
-                    if (isInternalMemoryEntry(entry)) continue;
-                    if (isArchiveConversationEntry(entry) != include_archived) continue;
-                    if (!wrote_header) {
-                        try w.writeAll("[Memory context]\n");
-                        wrote_header = true;
-                    }
-                    const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
-                    const sanitized = try sanitizeMemoryText(allocator, content);
-                    defer allocator.free(sanitized);
-                    try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
-                    appended += 1;
-                    if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
-                }
-            }
+        if (isArchiveConversationCandidate(cand)) continue;
+        if (!wrote_header) {
+            try w.writeAll("[Memory context]\n");
+            wrote_header = true;
         }
+        const snippet = util.truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
+        const sanitized = try sanitizeMemoryText(allocator, snippet);
+        defer allocator.free(sanitized);
+        try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
+        appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+    }
+    if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES) {
+        if (scoped_fallback_entries) |entries| {
+            for (entries) |entry| {
+                if (containsCandidateKey(scoped_candidates, entry.key)) continue;
+                if (isInternalMemoryEntry(entry)) continue;
+                if (isArchiveConversationEntry(entry)) continue;
+                if (!wrote_header) {
+                    try w.writeAll("[Memory context]\n");
+                    wrote_header = true;
+                }
+                const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
+                const sanitized = try sanitizeMemoryText(allocator, content);
+                defer allocator.free(sanitized);
+                try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
+                appended += 1;
+                if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
+            }
+        }
     }
 
     if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and session_id != null) {
@@ -634,13 +630,14 @@ test "loadContext prefers scoped facts when archive candidates fill recall windo
         try mem.store(key, "needle archived transcript", .{ .custom = "archive" }, "sess-a");
     }
 
-    // Regression: archive chunks can fill the raw recall limit and hide a lower-ranked scoped fact.
+    // Regression: archive chunks used to be injected after scoped facts and the
+    // model answered the archive instead of the live message (NullClawBot, 2026-09-22).
     const context = try loadContext(allocator, mem, "needle", "sess-a");
     defer allocator.free(context);
 
-    const fact_pos = std.mem.indexOf(u8, context, "scoped_fact") orelse return error.TestUnexpectedResult;
-    const archive_pos = std.mem.indexOf(u8, context, "archive:conversation:") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(fact_pos < archive_pos);
+    try std.testing.expect(std.mem.indexOf(u8, context, "scoped_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "archive:conversation:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "archived transcript") == null);
 }
 
 test "loadContextWithRuntime prefers scoped facts when engine candidates fill with archives" {
@@ -699,11 +696,12 @@ test "loadContextWithRuntime prefers scoped facts when engine candidates fill wi
         ._allocator = allocator,
     };
 
-    // Regression: engine top_k can fill with archive chunks and hide a lower-ranked scoped fact.
+    // Regression: engine top_k filled with archive chunks, which were then
+    // prepended to the live user message (NullClawBot, 2026-09-22).
     const context = try loadContextWithRuntime(allocator, &rt, "needle", "sess-a");
     defer allocator.free(context);
 
-    const fact_pos = std.mem.indexOf(u8, context, "scoped_fact") orelse return error.TestUnexpectedResult;
-    const archive_pos = std.mem.indexOf(u8, context, "archive:conversation:") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(fact_pos < archive_pos);
+    try std.testing.expect(std.mem.indexOf(u8, context, "scoped_fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "archive:conversation:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "archived transcript") == null);
 }
