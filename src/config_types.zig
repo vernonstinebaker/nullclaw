@@ -1331,6 +1331,9 @@ pub const MemoryConfig = struct {
     /// Profile preset — convenience shortcut for common setups.
     profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    /// Custom SQLite database location (absolute, or relative to the
+    /// workspace). Empty = default `<workspace>/memory.db`.
+    database_path: []const u8 = "",
     instance_id: []const u8 = "",
     auto_save: bool = true,
     /// When false, memory recall injection into inbound messages is skipped
