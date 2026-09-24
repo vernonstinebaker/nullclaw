@@ -254,6 +254,15 @@ Upstream `nullclaw/nullclaw` is dormant (no maintainer merges since 2026-04-17; 
 - Tier 3 (opportunistic, no urgency): #990 Eden AI provider, #956 alpine bump, #958 Teams JWT fix, #968 Matrix persistence, #981 grok-cli, #775 CLAUDE.md dedup, #774 doc stats.
 - Tier 4 (do not take): #319 DingTalk recall, #667 email/IMAP channel, #411 tool customization (this tree's `tool_filter_groups` cover the need), #982/#983 proxy transports, #989 README chart, #527 megapr (+617k lines).
 
+## Decision queue (needs user philosophy session — raised 2026-09-25 morning)
+
+| ID | Item | Context |
+|---|---|---|
+| Q1 | **#67 / up-993 Firecrawl endpoint — DEFERRED, do not implement or close yet.** | User is undecided between not-planned and other options pending Q2/Q3. No code changes without explicit approval. |
+| Q2 | **Provider philosophy: built-in vs MCP.** Which web-search providers (and by extension other tools) deserve first-class status versus being delegated to MCP? May diverge from upstream (@donprus's direction). User finds Firecrawl unreliable; the Feb 2026 multi-provider rework (`939dc07c`) added nine built-in providers upstream. |
+| Q3 | **Binary size.** Original attraction was <1 MB; now ~4.9 MB ReleaseSmall vs the AGENTS.md <1 MB target. Multi-provider search is a suspected contributor (unmeasured). Links to the parked size/RSS internal item. |
+| Q4 | **Brave key wiring (verify when back).** User's preferred provider is Brave; fleet configs set `http_request.search_api_key` but provider code reads `BRAVE_API_KEY` from the environment — whether the config field feeds the env lookup is unverified. Brave IS a built-in provider and first keyed slot in the auto chain. |
+
 ## Current handoff
 
 - **HEAD:** `90e4b01c` (= `origin/main`). Hardening phases 0–8 were committed and pushed as `90e4b01c` by the concurrent session after the previous handoff was written; working tree clean apart from the preserved untracked files.
