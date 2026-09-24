@@ -53,9 +53,13 @@ PR; physics says docs cannot alter the artifact — confirm the skip.)
         one maintainer-push per branch).
       - #989: no checks ran (README-only); verify by eye.
       - **All PRs show state=BLOCKED despite green checks** — branch
-        protection "review required". First merge attempt reveals whether the
-        maintain role clears it; if not, donprus approval (or protection
-        change) unblocks.
+        protection "review required". First merge attempt (2026-09-25, #962)
+        confirmed the gate: maintain role cannot merge, admin-bypass refused
+        ("At least 1 approving review is required by reviewers with write
+        access"), and repo-level auto-merge is disabled. **Campaign is gated
+        on donprus approvals** (one per PR, in runbook order) or a protection
+        change (relax required reviews, bypass list, or admin grant). Evidence
+        note + failed-merge state left clean on #962; nothing merged yet.
 
 ## Wave 1 — documentation (order: ours first, corrected others after)
 
