@@ -42,11 +42,20 @@ PR; physics says docs cannot alter the artifact — confirm the skip.)
 
 ## Wave 0 — pre-flight (no merges)
 
-- [ ] Courtesy note to donprus: intent to merge docs + own fleet-validated
-      PRs, sequenced over several days. Not permission — no surprise.
-- [ ] Check maintainer-edit permission on telagod's PR branches (#776/#777).
-      If absent, corrections land as immediate follow-up commits post-merge.
-- [ ] Record CI status + mergeability for every PR in waves 1–3.
+- [x] Courtesy note to donprus — done via Discord by the user (2026-09-25).
+- [x] Maintainer-edit permission: **true on every branch** including telagod's
+      (#776/#777) — corrections can be pushed to PR branches pre-merge.
+- [x] CI + mergeability audit (2026-09-25):
+      - MERGEABLE + CI SUCCESS: #962, #963, #776, #953, #954, #959, #970,
+        #966, #987, #971 (971 still draft — un-draft in wave 3).
+      - **CONFLICTING (branch update required before merge): #777, #775, #774**
+        (telagod's April docs PRs rotted against main; rebase + corrections in
+        one maintainer-push per branch).
+      - #989: no checks ran (README-only); verify by eye.
+      - **All PRs show state=BLOCKED despite green checks** — branch
+        protection "review required". First merge attempt reveals whether the
+        maintain role clears it; if not, donprus approval (or protection
+        change) unblocks.
 
 ## Wave 1 — documentation (order: ours first, corrected others after)
 
