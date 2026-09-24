@@ -48,6 +48,25 @@ Detailed skill documentation here.
 
 ## SkillForge (Auto-Discovery)
 
+### Sharing skills across agents and hosts (symlinks)
+
+A skill directory in the workspace `skills/` folder may be a **symbolic link**.
+Keep one canonical copy of your skills in a git repo or synced folder, and
+place a symlink per agent or host:
+
+```bash
+ln -s /srv/git/my-skills/git-helper ~/.nullclaw/workspace/skills/git-helper
+```
+
+`nullclaw skills list` and the agent follow such links like normal skill
+directories; broken links are ignored. Because `SKILL.md` is a cross-runtime
+format, the same canonical copy can also be linked into other agents that read
+it (e.g. ZeroClaw or Hermes Agent workspaces). Skills installed from
+web-downloaded archives are unaffected — the archive security audit still
+rejects symlink entries inside archives.
+
+## SkillForge (Auto-Discovery)
+
 SkillForge can automatically discover and evaluate skills from GitHub.
 
 ```json
