@@ -23,6 +23,9 @@ result
 config.signal.json
 config.json
 
+# Local-only planning/ops docs (not part of the published tree)
+/PLAN.md
+
 # IDE configurations
 .idea/
 .vscode/
